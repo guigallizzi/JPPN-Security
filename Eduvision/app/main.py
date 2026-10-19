@@ -19,6 +19,10 @@ from app import config as C
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 db = DB(C.DB_PATH)
+with db.get_connection() as _c:  # amostras da biometria avançada (1 linha por amostra)
+    _c.execute("CREATE TABLE IF NOT EXISTS face_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+               "student_id INTEGER NOT NULL, model TEXT NOT NULL, vec BLOB NOT NULL)")
+    _c.commit()
 
 IS_WINDOWS = sys.platform.startswith("win")
 
@@ -31,8 +35,38 @@ cv2.setNumThreads(max(2, (os.cpu_count() or 4) // 2))
 LIMIAR_SIMILARIDADE = getattr(C, "LIMIAR_SIMILARIDADE", 0.363)  # recomendado p/ SFace (cosseno); ajustável no config.py
 DEBUG_IA = False              # mostra a similaridade no vídeo/console para diagnóstico (ponha False depois)
 LIMIAR_INTRUSO = 0.85         # confiança mínima do detector para contar como intruso
-LARGURA_DETECCAO = 640        # a detecção roda numa imagem reduzida (mais rápido)
+LARGURA_DETECCAO = 2560       # a detecção roda numa imagem reduzida (maior = acha rostos mais distantes, mais lento)
+CONF_DETECTOR = 0.75          # confiança mínima do YuNet para considerar um rosto (antes 0.8)
+MIN_LADO_RECONHECER = 16      # rostos menores que isso (px) ficam "distante": nem reconhece nem acusa intruso
+LADO_ROSTO_BOM = 40           # abaixo disso o rosto é "pequeno": exige similaridade maior (+BONUS_PEQUENO)
+BONUS_PEQUENO = 0.05
+ZOOM_LARGURA = 220            # zoom na cabeça: amplia o recorte até ~essa largura (px)
+ZOOM_MAX = 4.0                # ampliação máxima do zoom digital
+MARGEM_AMBIGUIDADE = 0.05     # o melhor aluno precisa vencer o 2º colocado por essa margem (evita confundir parecidos)
+# --- Biometria avançada (ArcFace / InsightFace). Se o .onnx não existir, usa o SFace como antes.
+ARC_MODELO = getattr(C, "ARC_MODELO", "w600k_mbf.onnx")   # ou "w600k_r50.onnx" (mais preciso, ~8x mais lento)
+LIMIAR_ARC = getattr(C, "LIMIAR_ARC", 0.35)               # cosseno mínimo no ArcFace
+MARGEM_ARC = 0.08                                         # folga mínima sobre o 2º colocado no ArcFace
+# --- Anti-troca: pontuação acumulada por pessoa rastreada (decai a cada nova observação do rosto)
+DECAIMENTO = 0.85             # peso das observações antigas
+SCORE_TROCA = 1.0             # para trocar o nome de alguém já identificado, o novo precisa vencer por essa folga
+REVERIFICAR_S = 1.0           # pessoa já identificada: recalcula a biometria só a cada N s (economiza CPU)
+CONFIRMAR_ALUNO = 3           # reconhecimentos do mesmo aluno para confirmar presença (roteiro: não confirmar com 1 frame)
+AMOSTRAS_POR_CAPTURA = 10     # embeddings coletados a cada clique em CAPTURAR
+MAX_AMOSTRAS = 40             # máximo de amostras guardadas por aluno (recapturar ACUMULA poses)
+MIN_LADO_CADASTRO = 30        # rosto mínimo (px) aceito no cadastro (baixo p/ cadastrar SENTADO na cadeira)
+# --- Rastreamento de pessoas (YOLO): reconhece o rosto UMA vez e mantém o nome na pessoa
+#     mesmo de lado / olhando para baixo / de costas, enquanto ela continuar no lugar.
+USAR_TRACKING = getattr(C, "USAR_TRACKING", True)
+CONF_PESSOA = 0.35            # confiança mínima do YOLO para "pessoa"
+IMGSZ_YOLO = 960              # resolução de entrada do YOLO (maior = acha pessoas menores, mais lento)
+IOU_MESMA_PESSOA = 0.30       # sobreposição mínima entre caixas p/ ser a mesma pessoa no frame seguinte
+TTL_TRILHA = 8.0              # segundos que uma pessoa some (oclusão) antes de perder o nome
+FRONTAL_MIN, FRONTAL_MAX = 0.25, 0.75  # rosto "de frente" (nariz entre os olhos): só esses contam como intruso
 PROCESSAR_A_CADA = 3          # (não usado: a IA roda em thread própria)
+ROI_CAM_1 = getattr(C, "ROI_CAM_1", None)  # área das cadeiras (x1, y1, x2, y2) em fração da imagem; None = imagem toda
+LARGURA_RAPIDA = 960          # detector rápido (só posição dos quadros) roda nessa largura a cada frame
+YOLO_A_CADA = 3               # roda o YOLO (pesado) 1 a cada N ciclos de IA; entre eles reaproveita as pessoas
 IA_INTERVALO_MIN = 0.12       # s entre análises da IA (~8/s). Maior = mais FPS de vídeo, menos reatividade
 LIMIAR_MESMO_DESCONHECIDO = 0.40  # similaridade p/ considerar que dois rostos desconhecidos são a MESMA pessoa
 CONFIRMAR_APOS = 3            # detecções seguidas para confirmar um desconhecido (evita falso alarme de 1 frame)
@@ -50,6 +84,7 @@ COR_INTRUSO = (0, 140, 255)
 # ---------------------------------------------------------------------------
 det = None
 rec = None
+det_rapido = None   # 2º detector, só para seguir os rostos a cada frame (sem disputar lock com a IA)
 
 model_det_path = str(C.MODELS_DIR / "face_detection_yunet_2023mar.onnx")
 model_rec_path = str(C.MODELS_DIR / "face_recognition_sface_2021dec.onnx")
@@ -60,33 +95,70 @@ try:
     elif not os.path.exists(model_rec_path):
         print(f"[ERRO] Modelo de reconhecimento não encontrado: {model_rec_path}")
     else:
-        det = cv2.FaceDetectorYN.create(model_det_path, "", (320, 320), 0.8, 0.3, 5000)
+        det = cv2.FaceDetectorYN.create(model_det_path, "", (320, 320), CONF_DETECTOR, 0.3, 5000)
         rec = cv2.FaceRecognizerSF.create(model_rec_path, "")
+        det_rapido = cv2.FaceDetectorYN.create(model_det_path, "", (320, 320), CONF_DETECTOR, 0.3, 5000)
         print("Modelos de IA carregados com sucesso!")
 except Exception as e:
     det = None
     rec = None
     print(f"[ERRO] Falha ao carregar modelos de IA: {e}")
 
+arc, arc_in = None, None
+try:
+    _arc_path = C.MODELS_DIR / ARC_MODELO
+    if _arc_path.exists():
+        import onnxruntime as ort
+        _so = ort.SessionOptions()
+        _so.intra_op_num_threads = max(2, (os.cpu_count() or 4) // 2)
+        arc = ort.InferenceSession(str(_arc_path), _so, providers=["CPUExecutionProvider"])
+        arc_in = arc.get_inputs()[0].name
+        print(f"Biometria AVANÇADA ativa (ArcFace {ARC_MODELO})")
+    else:
+        print(f"[AVISO] Biometria avançada desligada: {ARC_MODELO} não está em {C.MODELS_DIR} (usando SFace)")
+except Exception as e:
+    arc = None
+    print(f"[AVISO] Biometria avançada desligada ({e!r}); usando SFace")
+
+MODELO_BIO = "arc" if arc is not None else "sface"
+if arc is not None:  # limiares próprios do ArcFace
+    LIMIAR_SIMILARIDADE = LIMIAR_ARC
+    MARGEM_AMBIGUIDADE = MARGEM_ARC
+    LIMIAR_MESMO_DESCONHECIDO = 0.30
+SCORE_CONFIRMA = CONFIRMAR_ALUNO * LIMIAR_SIMILARIDADE  # ~3 boas observações para fixar o nome
+
 if det is None or rec is None:
     print("[AVISO] Reconhecimento facial DESATIVADO. Baixe os modelos do OpenCV Zoo "
           "(face_detection_yunet_2023mar.onnx e face_recognition_sface_2021dec.onnx) "
           f"e coloque em: {C.MODELS_DIR}")
 
-app = FastAPI(title="EduVision // JPPN Command Center", version="7.4")
+yolo = None
+if USAR_TRACKING:
+    try:
+        from ultralytics import YOLO
+        _cands = [Path(getattr(C, "YOLO_MODEL", "")) if getattr(C, "YOLO_MODEL", None) else None,
+                  C.MODELS_DIR / "yolov8n.pt", BASE_DIR / "models" / "yolov8n.pt", BASE_DIR / "yolov8n.pt"]
+        _yolo_path = next((p for p in _cands if p and p.exists()), None)
+        if _yolo_path is None:
+            print(f"[AVISO] Rastreamento DESATIVADO: coloque yolov8n.pt em {C.MODELS_DIR}")
+        else:
+            yolo = YOLO(str(_yolo_path))
+            yolo.predict(np.zeros((480, 640, 3), dtype=np.uint8), verbose=False)  # aquece
+            print(f"Rastreamento de pessoas ATIVO ({_yolo_path.name})")
+    except Exception as e:
+        yolo = None
+        print(f"[AVISO] Rastreamento DESATIVADO ({e!r}). Seguindo só com reconhecimento facial.")
+
+app = FastAPI(title="JPPN Security School", version="7.5")
 
 # ---------------------------------------------------------------------------
 # Estado compartilhado
 # ---------------------------------------------------------------------------
 frame_atual_1 = None      # frame com caixas desenhadas (stream)
 frame_limpo_1 = None      # frame sem anotações (usado no cadastro da biometria)
-frame_atual_2 = None
-frame_limpo_2 = None
 camera_1_online = False
-camera_2_online = False
 camera_1_fonte = "NENHUMA"   # "AIBOX", "WEBCAM" ou "NENHUMA"
 fps_1 = 0
-fps_2 = 0
 current_intruders_count = 0
 
 lock = threading.Lock()          # protege os frames
@@ -95,15 +167,19 @@ cache_lock = threading.Lock()
 
 _cache_alunos = {"t": 0.0, "dados": []}
 _ultimo_registro = {}            # rm -> timestamp do último log de presença
+_votos = {}                      # rm -> {"hits", "t0", "last"} para confirmar o aluno em vários frames
 _ultimo_intruso = 0.0
 _erros_vistos = set()
 
-frame_id = {1: 0, 2: 0}          # contador de frames novos (o stream só envia frames novos)
+frame_id = {1: 0}                # contador de frames novos (o stream só envia frames novos)
 ia_estado = {"resultados": []}   # últimos rostos detetados pela thread de IA
 reconhecidos = {}                # rm -> dados do aluno reconhecido hoje (vai para o dashboard)
 reg_lock = threading.Lock()
 ia_info = {"alunos_carregados": 0, "rostos": 0, "melhor_nome": None, "melhor_sim": None,
-           "ultimo_erro": None, "limiar": LIMIAR_SIMILARIDADE}
+           "ultimo_erro": None, "limiar": LIMIAR_SIMILARIDADE, "pessoas": 0, "tracking": False, "sem_biometria_avancada": 0}
+_ciclo_yolo = 0
+trilhas = {}                     # id -> pessoa rastreada (caixa, aluno identificado, votos)
+_prox_trilha = 1
 _ultimo_print_ia = 0.0
 desconhecidos = []              # pessoas desconhecidas já vistas (galeria de embeddings, 1ª detecção, miniatura)
 _contador_desconhecidos = 0
@@ -127,6 +203,7 @@ def abrir_rtsp(url):
     if cap.isOpened():
         ok, frame = cap.read()
         if ok and frame is not None:
+            print(f"[RTSP] conectado: {frame.shape[1]}x{frame.shape[0]}")
             return cap
     cap.release()
     return None
@@ -196,6 +273,28 @@ def carregar_alunos():
             return _cache_alunos["dados"]
 
     dados = []
+    if MODELO_BIO == "arc":
+        try:
+            with db.get_connection() as conn:
+                rows = conn.execute("SELECT s.id, s.name, s.turma, f.vec FROM face_samples f "
+                                    "JOIN students s ON s.id = f.student_id WHERE f.model = ? ORDER BY f.id",
+                                    (ARC_MODELO,)).fetchall()
+                total = conn.execute("SELECT COUNT(*) FROM students WHERE embedding IS NOT NULL").fetchone()[0]
+            por_aluno = {}
+            for r in rows:
+                a = por_aluno.setdefault(r[0], ({"id": r[0], "name": r[1], "turma": r[2]}, []))
+                v = np.frombuffer(r[3], dtype=np.float32)
+                if v.size == 512 and np.linalg.norm(v) > 0:
+                    a[1].append(v / np.linalg.norm(v))
+            dados = [(a, np.asarray(g, dtype=np.float32)) for a, g in por_aluno.values() if g]
+            ia_info["sem_biometria_avancada"] = max(0, total - len(dados))
+        except Exception as e:
+            _avisar_uma_vez("db", f"Erro ao ler amostras ArcFace: {e}")
+        with cache_lock:
+            _cache_alunos["dados"] = dados
+            _cache_alunos["t"] = agora
+        ia_info["alunos_carregados"] = len(dados)
+        return dados
     try:
         for s in db.get_students_with_samples():
             s = dict(s)
@@ -203,12 +302,14 @@ def carregar_alunos():
             if not emb:
                 continue
             v = np.frombuffer(emb, dtype=np.float32)
-            if v.size != 128:
+            if v.size == 0 or v.size % 128 != 0:
                 continue
-            n = np.linalg.norm(v)
-            if n == 0:
+            g = v.reshape(-1, 128)                       # 1 linha por amostra
+            n = np.linalg.norm(g, axis=1, keepdims=True)
+            g = g[n[:, 0] > 0] / n[n[:, 0] > 0]
+            if len(g) == 0:
                 continue
-            dados.append((s, (v / n).astype(np.float32)))
+            dados.append((s, g.astype(np.float32)))
     except Exception as e:
         _avisar_uma_vez("db", f"Erro ao ler alunos do banco: {e}")
 
@@ -247,7 +348,31 @@ def detectar_rostos(img):
     return list(faces)
 
 
+ARCFACE_DST = np.array([[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366],
+                        [41.5493, 92.3655], [70.7299, 92.2041]], dtype=np.float32)
+
+
+def extrair_arc(img, face):
+    """Embedding ArcFace normalizado (512,): alinha pelos 5 pontos do YuNet no padrão 112x112 do InsightFace."""
+    pts = np.asarray(face[4:14], dtype=np.float32).reshape(5, 2)
+    M, _ = cv2.estimateAffinePartial2D(pts, ARCFACE_DST, method=cv2.LMEDS)
+    if M is None:
+        return None
+    alinhado = cv2.warpAffine(img, M, (112, 112), borderValue=0)
+    blob = cv2.dnn.blobFromImage(alinhado, 1.0 / 127.5, (112, 112), (127.5, 127.5, 127.5), swapRB=True)
+    feat = arc.run(None, {arc_in: blob})[0].flatten().astype(np.float32)
+    n = np.linalg.norm(feat)
+    return feat / n if n > 0 else None
+
+
 def extrair_embedding(img, face):
+    """Embedding do modelo ativo (ArcFace se disponível, senão SFace)."""
+    if MODELO_BIO == "arc":
+        return extrair_arc(img, face)
+    return extrair_sface(img, face)
+
+
+def extrair_sface(img, face):
     """Embedding SFace normalizado, shape (128,), float32."""
     with ia_lock:
         alinhado = rec.alignCrop(img, face)
@@ -320,62 +445,338 @@ def rastrear_desconhecido(frame, face, feat, agora):
     return numero
 
 
-def analisar_frame(frame):
-    """Roda detecção + reconhecimento. Retorna (lista de (box, label, cor), qtd_intrusos)."""
-    global _ultimo_print_ia
-    resultados, intrusos, agora = [], 0, time.time()
-    alunos = carregar_alunos()
+def _frontal(face):
+    """Rosto de frente? Usa os landmarks do YuNet: nariz entre os dois olhos."""
+    rex, lex, nx = float(face[4]), float(face[6]), float(face[8])
+    d = lex - rex
+    if abs(d) < 1e-3:
+        return False
+    r = (nx - rex) / d
+    return FRONTAL_MIN <= r <= FRONTAL_MAX
 
-    for face in detectar_rostos(frame):
-        box = face[:4].astype(int)
-        conf_det = float(face[-1])
-        label, cor, reconhecido = "Desconhecido", COR_INTRUSO, False
-        melhor, melhor_sim, feat = None, -1.0, None
 
-        try:
-            feat = extrair_embedding(frame, face)
-            if feat is not None:
-                for aluno, emb in alunos:
-                    sim = float(np.dot(feat, emb))  # ambos normalizados = cosseno
-                    if sim > melhor_sim:
-                        melhor_sim, melhor = sim, aluno
-                if melhor is not None and melhor_sim >= LIMIAR_SIMILARIDADE:
-                    nome, rm = melhor["name"], f"RM{melhor['id']:04d}"
-                    turma = melhor.get("turma", "1ECA")
-                    label, cor, reconhecido = f"{nome} ({int(melhor_sim * 100)}%)", COR_RECONHECIDO, True
-                    registrar_reconhecido(rm, nome, turma, melhor_sim, agora)
-                    if agora - _ultimo_registro.get(rm, 0) > COOLDOWN_PRESENCA:
-                        _ultimo_registro[rm] = agora
-                        db.log_attendance(rm=rm, name=nome, turma=turma,
-                                          camera_id="CAM_01", confidence=float(melhor_sim))
-        except Exception as e:
-            _avisar_uma_vez("reconhecimento", f"Falha no reconhecimento: {e!r}")
+def _identificar(feat, alunos):
+    """Compara com a galeria de cada aluno. Retorna (aluno_aceito|None, melhor_aluno, melhor_sim)."""
+    melhor, melhor_sim, segundo = None, -1.0, -1.0
+    for aluno, galeria in alunos:
+        sim = float(np.max(galeria @ feat))  # melhor amostra do aluno (cosseno)
+        if sim > melhor_sim:
+            segundo = melhor_sim
+            melhor_sim, melhor = sim, aluno
+        elif sim > segundo:
+            segundo = sim
+    claro = len(alunos) < 2 or (melhor_sim - segundo) >= MARGEM_AMBIGUIDADE
+    ok = melhor is not None and melhor_sim >= LIMIAR_SIMILARIDADE and claro
+    return (melhor if ok else None), melhor, melhor_sim
 
-        if not reconhecido and conf_det > LIMIAR_INTRUSO:
+
+def _rm(aluno):
+    return f"RM{aluno['id']:04d}"
+
+
+def _presenca(aluno, sim, agora):
+    nome, rm, turma = aluno["name"], _rm(aluno), aluno.get("turma", "1ECA")
+    registrar_reconhecido(rm, nome, turma, sim, agora)
+    if agora - _ultimo_registro.get(rm, 0) > COOLDOWN_PRESENCA:
+        _ultimo_registro[rm] = agora
+        db.log_attendance(rm=rm, name=nome, turma=turma, camera_id="CAM_01", confidence=float(sim))
+
+
+def _iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    iw = max(0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    un = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / un if un > 0 else 0.0
+
+
+def detectar_pessoas(frame, agora):
+    """YOLO (classe pessoa) + rastreador simples por sobreposição. Retorna [(id, caixa xyxy)]."""
+    global _prox_trilha, _ciclo_yolo
+    _ciclo_yolo += 1
+    if _ciclo_yolo % YOLO_A_CADA != 1 and trilhas:
+        # pessoas sentadas quase não se mexem: reaproveita as caixas do último YOLO
+        return [(tid, t["box"]) for tid, t in trilhas.items() if agora - t["last"] < 1.5]
+    r = yolo.predict(frame, classes=[0], conf=CONF_PESSOA, imgsz=IMGSZ_YOLO, verbose=False)[0]
+    caixas = [] if r.boxes is None else [tuple(int(v) for v in b) for b in r.boxes.xyxy.cpu().numpy()]
+
+    pares = sorted(((_iou(t["box"], c), tid, k) for tid, t in trilhas.items() for k, c in enumerate(caixas)),
+                   reverse=True)
+    usados_t, usados_c, saida = set(), set(), []
+    for iou, tid, k in pares:
+        if iou < IOU_MESMA_PESSOA:
+            break
+        if tid in usados_t or k in usados_c:
+            continue
+        usados_t.add(tid); usados_c.add(k)
+        trilhas[tid].update(box=caixas[k], last=agora)
+        saida.append((tid, caixas[k]))
+    for k, c in enumerate(caixas):
+        if k not in usados_c:
+            tid = _prox_trilha; _prox_trilha += 1
+            trilhas[tid] = {"box": c, "last": agora, "votos": {}, "cands": {}, "aluno": None,
+                            "sim": 0.0, "desc": 0, "num": None, "score": {}, "verif": 0.0}
+            saida.append((tid, c))
+    for tid in [t for t, v in trilhas.items() if agora - v["last"] > TTL_TRILHA]:
+        del trilhas[tid]
+    return saida
+
+
+def _por_rosto(frame, infos, agora):
+    """Modo sem rastreamento (ou rosto sem pessoa associada): decide rosto a rosto."""
+    resultados, intrusos = [], 0
+    for inf in infos:
+        face, box = inf["face"], inf["box"]
+        if inf["pequeno"] or inf["feat"] is None:
+            continue  # rosto pequeno demais para decidir: não desenha
+        if inf["conflito"]:
+            resultados.append((box, "Desconhecido", COR_INTRUSO))  # parecido com aluno já visto em outro rosto
+            continue
+        aluno = inf["aluno"]
+        if aluno is not None:
+            rm = _rm(aluno)
+            v = _votos.get(rm)
+            if v is None or agora - v["last"] > JANELA_CONFIRMACAO:
+                v = _votos[rm] = {"hits": 0, "t0": agora, "last": agora}
+            v["hits"] += 1
+            v["last"] = agora
+            if v["hits"] >= CONFIRMAR_ALUNO:
+                _presenca(aluno, inf["sim"], agora)  # grava presença só após confirmar
+            resultados.append((box, f"{aluno['name']} ({int(inf['sim'] * 100)}%)", COR_RECONHECIDO))
+            continue
+        label = "Desconhecido"
+        if inf["conf"] > LIMIAR_INTRUSO and inf["frontal"]:
             intrusos += 1
-            if feat is not None and face[2] >= MIN_LADO_ROSTO:
+            if face[2] >= MIN_LADO_ROSTO:
                 try:
-                    numero = rastrear_desconhecido(frame, face, feat, agora)
+                    numero = rastrear_desconhecido(frame, face, inf["feat"], agora)
                     if numero:
                         label = f"Desconhecido #{numero}"
                 except Exception as e:
                     _avisar_uma_vez("rastreio", f"Falha ao rastrear desconhecido: {e!r}")
-            if DEBUG_IA and melhor is not None:
-                label += f" (melhor: {melhor['name']} {melhor_sim:.2f})"
+            resultados.append((box, label, COR_INTRUSO))
+        else:
+            resultados.append((box, "Desconhecido", COR_INTRUSO))  # de lado: mostra, mas não conta intruso
+    return resultados, intrusos
 
-        resultados.append((box, label, cor))
-        ia_info["melhor_nome"] = melhor["name"] if melhor is not None else None
-        ia_info["melhor_sim"] = round(melhor_sim, 3) if melhor is not None else None
 
-    ia_info["rostos"] = len(resultados)
-    if DEBUG_IA and resultados and agora - _ultimo_print_ia > 2:
+def _dono(rm, tid, agora):
+    """Outra pessoa rastreada (viva) que já está com esse aluno."""
+    for t2id, t2 in trilhas.items():
+        if t2id != tid and t2["aluno"] is not None and _rm(t2["aluno"]) == rm and agora - t2["last"] < 2.0:
+            return t2
+    return None
+
+
+def _atualizar_identidade(tid, t, inf, agora):
+    """Pontuação acumulada com decaimento + exclusividade (um aluno não pode estar em 2 lugares)."""
+    for k in t["score"]:
+        t["score"][k] *= DECAIMENTO
+    if inf["aluno"] is not None:
+        rm = _rm(inf["aluno"])
+        t["score"][rm] = t["score"].get(rm, 0.0) + inf["sim"]
+        t["cands"][rm] = inf["aluno"]
+        if t["aluno"] is not None and _rm(t["aluno"]) == rm:
+            t["sim"], t["verif"] = inf["sim"], agora
+
+    atual = _rm(t["aluno"]) if t["aluno"] is not None else None
+    for rm, sc in sorted(t["score"].items(), key=lambda kv: kv[1], reverse=True):
+        if sc < SCORE_CONFIRMA:
+            break
+        dono = _dono(rm, tid, agora)
+        if dono is not None and sc < dono["score"].get(rm, 0.0) + SCORE_TROCA:
+            continue  # outra pessoa já é esse aluno: só toma o nome com folga grande
+        if rm != atual and (atual is None or sc >= t["score"].get(atual, 0.0) + SCORE_TROCA):
+            if dono is not None:
+                dono["aluno"] = None
+            t["aluno"] = t["cands"][rm]
+            t["sim"], t["verif"] = (inf["sim"] if inf["aluno"] is not None else sc / 6.0), agora
+        break
+    # muitas observações contra: perde o nome
+    if t["aluno"] is not None and t["score"].get(_rm(t["aluno"]), 0.0) < 0.5 * SCORE_CONFIRMA:
+        t["aluno"] = None
+
+
+def _por_pessoa(frame, infos, pessoas, agora):
+    """Modo com rastreamento: o nome fica preso na PESSOA, não no rosto."""
+    resultados, intrusos = [], 0
+    por_tid = {i["tid"]: i for i in infos if i["tid"] is not None}
+    for tid, (x1, y1, x2, y2) in pessoas:
+        t = trilhas[tid]
+        t.setdefault("score", {})
+        t.setdefault("verif", 0.0)
+        inf = por_tid.get(tid)
+
+        if inf is not None and inf["feat"] is not None:
+            # se o aluno sugerido já está firme em outra pessoa, esse rosto não pode ser ele
+            if inf["aluno"] is not None:
+                dono = _dono(_rm(inf["aluno"]), tid, agora)
+                if dono is not None and dono["score"].get(_rm(inf["aluno"]), 0) >= SCORE_CONFIRMA \
+                        and inf["sim"] < dono["sim"] + MARGEM_AMBIGUIDADE:
+                    inf["aluno"], inf["conflito"] = None, True
+            _atualizar_identidade(tid, t, inf, agora)
+            if (inf["aluno"] is None and not inf["conflito"] and t["aluno"] is None
+                    and inf["frontal"] and inf["conf"] > LIMIAR_INTRUSO):
+                t["desc"] += 1  # rosto DE FRENTE e nítido que não bate com ninguém
+            elif inf["aluno"] is not None:
+                t["desc"] = 0
+
+        # desenha só no ROSTO; sem rosto visível mas já identificado: quadro na região da cabeça
+        if inf is not None:
+            caixa = tuple(int(v) for v in inf["box"])
+        else:
+            lw = x2 - x1
+            caixa = (int(x1 + 0.25 * lw), int(y1), int(0.5 * lw), int(0.5 * lw))
+
+        if t["aluno"] is not None:
+            # nome estável da pessoa (não pisca entre alunos a cada frame)
+            _presenca(t["aluno"], t["sim"], agora)
+            resultados.append((caixa, f"{t['aluno']['name']} ({int(t['sim'] * 100)}%)", COR_RECONHECIDO))
+        elif t["desc"] >= CONFIRMAR_APOS:
+            intrusos += 1
+            if inf is not None and inf["feat"] is not None and inf["face"][2] >= MIN_LADO_ROSTO:
+                try:
+                    n = rastrear_desconhecido(frame, inf["face"], inf["feat"], agora)
+                    if n:
+                        t["num"] = n
+                except Exception as e:
+                    _avisar_uma_vez("rastreio", f"Falha ao rastrear desconhecido: {e!r}")
+            resultados.append((caixa, f"Desconhecido #{t['num']}" if t["num"] else "Desconhecido", COR_INTRUSO))
+        elif inf is not None and inf["aluno"] is not None:
+            resultados.append((caixa, f"{inf['aluno']['name']} ({int(inf['sim'] * 100)}%)", COR_RECONHECIDO))
+        elif inf is not None and inf["feat"] is not None:
+            resultados.append((caixa, "Desconhecido", COR_INTRUSO))
+
+    r2, i2 = _por_rosto(frame, [i for i in infos if i["tid"] is None], agora)
+    return resultados + r2, intrusos + i2
+
+
+def _montar_info(img, face, face_frame, alunos, tid=None, calcular=True):
+    """img/face: onde o embedding é extraído (pode ser o recorte ampliado). face_frame: coordenadas no frame."""
+    lado = min(face_frame[2], face_frame[3])
+    inf = {"face": face_frame, "box": face_frame[:4].astype(int), "conf": float(face[-1]), "usado": tid is not None,
+           "pequeno": lado < MIN_LADO_RECONHECER, "frontal": _frontal(face), "tid": tid, "conflito": False,
+           "feat": None, "aluno": None, "melhor": None, "sim": -1.0}
+    if not inf["pequeno"] and calcular:
+        try:
+            inf["feat"] = extrair_embedding(img, face)
+            if inf["feat"] is not None and alunos:
+                inf["aluno"], inf["melhor"], inf["sim"] = _identificar(inf["feat"], alunos)
+                # rosto pequeno = embedding menos confiável: só aceita com folga maior
+                if (inf["aluno"] is not None and lado < LADO_ROSTO_BOM
+                        and inf["sim"] < LIMIAR_SIMILARIDADE + BONUS_PEQUENO):
+                    inf["aluno"] = None
+        except Exception as e:
+            _avisar_uma_vez("reconhecimento", f"Falha no reconhecimento: {e!r}")
+    return inf
+
+
+def _rosto_ampliado(frame, caixa):
+    """Zoom digital na cabeça de uma pessoa (parte de cima da caixa do YOLO) para achar rostos distantes."""
+    x1, y1, x2, y2 = [int(v) for v in caixa]
+    H, W = frame.shape[:2]
+    x1, y1, x2 = max(x1, 0), max(y1, 0), min(x2, W)
+    y2c = min(y1 + int(0.45 * (y2 - y1)), H)
+    crop = frame[y1:y2c, x1:x2]
+    if crop.size == 0 or crop.shape[1] < 10 or crop.shape[0] < 10:
+        return None
+    esc = min(ZOOM_MAX, max(1.0, ZOOM_LARGURA / crop.shape[1]))
+    up = cv2.resize(crop, None, fx=esc, fy=esc, interpolation=cv2.INTER_CUBIC) if esc > 1 else crop
+    with ia_lock:
+        det.setInputSize((up.shape[1], up.shape[0]))
+        _, faces = det.detect(up)
+    if faces is None or len(faces) == 0:
+        return None
+    f = max(faces, key=lambda v: v[2] * v[3]).copy()
+    ff = f.copy()
+    ff[:14] /= esc
+    ff[[0, 4, 6, 8, 10, 12]] += x1  # x da caixa e dos 5 landmarks (2/3 são largura/altura)
+    ff[[1, 5, 7, 9, 11, 13]] += y1  # y
+    return up, f, ff
+
+
+def _exclusivo(infos):
+    """No mesmo frame, um aluno só pode ser UM rosto: fica com o de maior similaridade."""
+    melhor = {}
+    for inf in infos:
+        if inf["aluno"] is not None:
+            rm = _rm(inf["aluno"])
+            if rm not in melhor or inf["sim"] > melhor[rm]["sim"]:
+                melhor[rm] = inf
+    for inf in infos:
+        if inf["aluno"] is not None and melhor[_rm(inf["aluno"])] is not inf:
+            inf["aluno"], inf["conflito"] = None, True
+
+
+def analisar_frame(frame):
+    """Detecção + reconhecimento (+ rastreamento de pessoas se o YOLO estiver disponível).
+    Retorna (lista de (box, label, cor), qtd_intrusos)."""
+    global _ultimo_print_ia
+    agora = time.time()
+    alunos = carregar_alunos()
+    rostos = [(frame, f, f) for f in detectar_rostos(frame)]
+
+    pessoas = None
+    if yolo is not None:
+        try:
+            pessoas = detectar_pessoas(frame, agora)
+        except Exception as e:
+            _avisar_uma_vez("yolo", f"Falha no rastreamento (seguindo só com rostos): {e!r}")
+            pessoas = None
+    ia_info["tracking"] = pessoas is not None
+
+    # associa cada rosto à pessoa (centro do rosto na parte de cima do corpo); sem rosto -> zoom na cabeça
+    dono_rosto = [None] * len(rostos)
+    if pessoas is not None:
+        for tid, (x1, y1, x2, y2) in pessoas:
+            achou = False
+            for k, (_, f, ff) in enumerate(rostos):
+                if dono_rosto[k] is None:
+                    cx, cy = ff[0] + ff[2] / 2, ff[1] + ff[3] / 2
+                    if x1 <= cx <= x2 and y1 <= cy <= y1 + 0.6 * (y2 - y1):
+                        dono_rosto[k], achou = tid, True
+                        break
+            if not achou:
+                r = _rosto_ampliado(frame, (x1, y1, x2, y2))
+                if r is not None:
+                    rostos.append(r)
+                    dono_rosto.append(tid)
+        ia_info["pessoas"] = len(pessoas)
+
+    infos = []
+    for (img, f, ff), tid in zip(rostos, dono_rosto):
+        t = trilhas.get(tid) if tid is not None else None
+        pular = t is not None and t.get("aluno") is not None and agora - t.get("verif", 0.0) < REVERIFICAR_S
+        infos.append(_montar_info(img, f, ff, alunos, tid=tid, calcular=not pular))
+    _exclusivo(infos)
+
+    if pessoas is not None:
+        resultados, intrusos = _por_pessoa(frame, infos, pessoas, agora)
+    else:
+        for i in infos:
+            i["tid"] = None
+        resultados, intrusos = _por_rosto(frame, infos, agora)
+
+    melhores = [i for i in infos if i["melhor"] is not None]
+    if melhores:
+        b = max(melhores, key=lambda i: i["sim"])
+        ia_info["melhor_nome"], ia_info["melhor_sim"] = b["melhor"]["name"], round(b["sim"], 3)
+    ia_info["rostos"] = len(infos)
+    if DEBUG_IA and infos and agora - _ultimo_print_ia > 2:
         _ultimo_print_ia = agora
-        print(f"[IA] alunos={len(alunos)} rostos={len(resultados)} melhor={ia_info['melhor_nome']} sim={ia_info['melhor_sim']}")
+        print(f"[IA] alunos={len(alunos)} rostos={len(infos)} pessoas={ia_info['pessoas']} "
+              f"melhor={ia_info['melhor_nome']} sim={ia_info['melhor_sim']}")
     return resultados, intrusos
 
 
 def desenhar(frame, resultados, fonte):
     saida = frame.copy()
+    if ROI_CAM_1:  # mostra a área analisada
+        h, w = saida.shape[:2]
+        cv2.rectangle(saida, (int(ROI_CAM_1[0] * w), int(ROI_CAM_1[1] * h)),
+                      (int(ROI_CAM_1[2] * w), int(ROI_CAM_1[3] * h)), (248, 189, 56), 1)
     for box, label, cor in resultados:
         x, y, w, h = [int(v) for v in box]
         cv2.rectangle(saida, (x, y), (x + w, y + h), cor, 2)
@@ -458,11 +859,70 @@ def capturar_camera_1(url):
             contador = 0
             inicio = time.time()
 
-        anotado = desenhar(frame, ia_estado["resultados"], fonte)
+        anotado = desenhar(frame, _para_desenho(), fonte)
         with lock:
             frame_limpo_1 = frame
             frame_atual_1 = anotado
             frame_id[1] += 1
+
+
+def _para_desenho():
+    """Usa as caixas reposicionadas pelo seguidor rápido (se recentes); senão, as da IA."""
+    rap = ia_estado.get("rapido")
+    if rap and time.time() - rap[0] < 0.5:
+        return rap[1]
+    return ia_estado["resultados"]
+
+
+def loop_caixas():
+    """Seguidor rápido: detecta só a POSIÇÃO dos rostos em todo frame e move para lá
+    os rótulos (nome/desconhecido) calculados pela IA, que roda mais devagar. Tira o atraso do quadro."""
+    ultimo = -1
+    base_ref, anterior = None, []
+    while True:
+        if det_rapido is None:
+            time.sleep(1)
+            continue
+        with lock:
+            frame = frame_limpo_1 if camera_1_online else None
+            fid = frame_id[1]
+        if frame is None or fid == ultimo:
+            time.sleep(0.005)
+            continue
+        ultimo = fid
+        try:
+            h, w = frame.shape[:2]
+            esc = max(1.0, w / LARGURA_RAPIDA)
+            peq = cv2.resize(frame, (int(w / esc), int(h / esc))) if esc > 1 else frame
+            det_rapido.setInputSize((peq.shape[1], peq.shape[0]))
+            _, faces = det_rapido.detect(peq)
+            rapidas = [] if faces is None else [tuple(int(v * esc) for v in f[:4]) for f in faces]
+
+            atual = ia_estado["resultados"]
+            if atual is not base_ref:          # chegou resultado novo da IA: reancora
+                base_ref, base = atual, list(atual)
+            else:                              # mesmo resultado: segue a partir da última posição
+                base = anterior
+            pares = []
+            for i, (bx, _, _) in enumerate(base):
+                bcx, bcy, lim = bx[0] + bx[2] / 2, bx[1] + bx[3] / 2, 1.5 * max(bx[2], bx[3], 20)
+                for k, (x, y, fw, fh) in enumerate(rapidas):
+                    d = ((x + fw / 2 - bcx) ** 2 + (y + fh / 2 - bcy) ** 2) ** 0.5
+                    if d <= lim:
+                        pares.append((d, i, k))
+            pares.sort()
+            mapa, usados = {}, set()
+            for d, i, k in pares:
+                if i not in mapa and k not in usados:
+                    mapa[i] = k
+                    usados.add(k)
+            saida = [(rapidas[mapa[i]], lab, cor) if i in mapa else (bx, lab, cor)
+                     for i, (bx, lab, cor) in enumerate(base)]
+            anterior = saida
+            ia_estado["rapido"] = (time.time(), saida)
+        except Exception as e:
+            _avisar_uma_vez("seguidor", f"Falha no seguidor rápido: {e!r}")
+            time.sleep(0.2)
 
 
 def loop_ia():
@@ -492,7 +952,15 @@ def loop_ia():
         t0 = time.time()
 
         try:
+            ox = oy = 0
+            if ROI_CAM_1:
+                h, w = frame.shape[:2]
+                ox, oy = int(ROI_CAM_1[0] * w), int(ROI_CAM_1[1] * h)
+                frame = frame[oy:int(ROI_CAM_1[3] * h), ox:int(ROI_CAM_1[2] * w)]
             resultados, intrusos = analisar_frame(frame)
+            if ox or oy:  # volta as caixas para a coordenada da imagem inteira
+                resultados = [((int(b[0]) + ox, int(b[1]) + oy, int(b[2]), int(b[3])), lab, cor)
+                              for b, lab, cor in resultados]
             ia_estado["resultados"] = resultados
             current_intruders_count = intrusos
         except Exception as e:
@@ -505,59 +973,13 @@ def loop_ia():
         time.sleep(max(0.0, IA_INTERVALO_MIN - (time.time() - t0)))
 
 
-def capturar_camera_2(url):
-    global frame_atual_2, frame_limpo_2, camera_2_online, fps_2
-
-    print("Iniciando captura CAM_02...")
-    cap = None
-    contador = 0
-    inicio = time.time()
-
-    while True:
-        if cap is None:
-            cap = abrir_rtsp(url)
-            if cap is None:
-                camera_2_online = False
-                standby = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(standby, "CAM_02 // AIBOX OFFLINE", (50, 240),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 140, 255), 2)
-                with lock:
-                    frame_atual_2 = standby
-                    frame_limpo_2 = None
-                    frame_id[2] += 1
-                time.sleep(5)
-                continue
-            print("CAM_02 conectada via RTSP.")
-
-        ok, frame = cap.read()
-        if not ok or frame is None or frame.size == 0:
-            camera_2_online = False
-            cap.release()
-            cap = None
-            time.sleep(1)
-            continue
-
-        camera_2_online = True
-        contador += 1
-        tempo = time.time() - inicio
-        if tempo >= 1:
-            fps_2 = contador / tempo
-            contador = 0
-            inicio = time.time()
-
-        with lock:
-            frame_atual_2 = frame
-            frame_limpo_2 = frame
-            frame_id[2] += 1
-
-
 # Inicia as threads de forma independente
 # (Se o arquivo roda como __main__, o uvicorn importa "app.main" de novo; iniciar aqui também
 #  abriria a webcam duas vezes e a segunda cópia ficaria sem câmera.)
 if __name__ != "__main__":
     threading.Thread(target=capturar_camera_1, args=(C.CAMERA_RTSP_1,), daemon=True).start()
     threading.Thread(target=loop_ia, daemon=True).start()
-    threading.Thread(target=capturar_camera_2, args=(C.CAMERA_RTSP_2,), daemon=True).start()
+    threading.Thread(target=loop_caixas, daemon=True).start()
 
 
 def gerar_video(cam_id):
@@ -565,8 +987,8 @@ def gerar_video(cam_id):
     ultimo = -1
     while True:
         with lock:
-            fid = frame_id[2] if cam_id == 2 else frame_id[1]
-            src = frame_atual_2 if cam_id == 2 else frame_atual_1
+            fid = frame_id[1]          # sistema com UMA câmera (CAM_01 / .108)
+            src = frame_atual_1
         if src is None or fid == ultimo:
             time.sleep(0.01)
             continue
@@ -607,13 +1029,11 @@ def status():
         "room_id": "JPPN_LAB_01",
         "camera_1_online": camera_1_online,
         "camera_1_source": camera_1_fonte,
-        "camera_2_online": camera_2_online,
         "ai_ready": det is not None and rec is not None,
         "ai": ia_info,
         "authorized_count": len(reconhecidos),
         "current_intruders_count": current_intruders_count,
-        "fps_1": round(fps_1, 2),
-        "fps_2": round(fps_2, 2)
+        "fps_1": round(fps_1, 2)
     }
 
 @app.get("/api/v1/recognized")
@@ -654,10 +1074,7 @@ def add_student(data: dict):
 
 def _frame_limpo(camera):
     with lock:
-        if camera == "CAM_01":
-            src = frame_limpo_1 if camera_1_online else None
-        else:
-            src = frame_limpo_2 if camera_2_online else None
+        src = frame_limpo_1 if camera_1_online else None  # só existe a CAM_01
         return src.copy() if src is not None else None
 
 @app.post("/api/v1/students/{student_id}/sample")
@@ -667,36 +1084,75 @@ def capture_sample(student_id: int, camera: str = "CAM_01"):
 
     # Junta até 3 embeddings de frames diferentes (sem caixas desenhadas) e faz a média:
     # o cadastro fica bem mais robusto a pequenas variações de pose/luz.
+    # Coleta várias amostras de frames diferentes (peça para a pessoa mexer levemente a cabeça).
+    # Amostras quase idênticas são descartadas para guardar poses variadas.
     embeddings = []
+    arcs = []
     houve_frame = False
-    for _ in range(8):
+    pequeno = False
+    for _ in range(45):  # ~7 s: tempo para a pessoa girar a cabeça devagar
         img = _frame_limpo(camera)
         if img is not None:
             houve_frame = True
             faces = detectar_rostos(img)
             if faces:
                 maior = max(faces, key=lambda f: f[2] * f[3])
-                feat = extrair_embedding(img, maior)
-                if feat is not None:
-                    embeddings.append(feat)
-                    if len(embeddings) >= 3:
-                        break
-        time.sleep(0.2)
+                if min(maior[2], maior[3]) < MIN_LADO_CADASTRO or float(maior[-1]) < 0.70:  # aceita rosto virado
+                    pequeno = True
+                else:
+                    feat = extrair_sface(img, maior)
+                    fa = extrair_arc(img, maior) if MODELO_BIO == "arc" else None
+                    ref = fa if fa is not None else feat
+                    if feat is not None and (MODELO_BIO != "arc" or fa is not None) and \
+                            all(float(np.dot(ref, e)) < 0.93 for e in (arcs if MODELO_BIO == "arc" else embeddings)):
+                        embeddings.append(feat)
+                        if fa is not None:
+                            arcs.append(fa)
+                        if len(embeddings) >= AMOSTRAS_POR_CAPTURA:
+                            break
+        time.sleep(0.15)
 
     if not houve_frame:
         return JSONResponse({"detail": "Frame indisponível (câmera offline)"}, status_code=400)
     if not embeddings:
-        return JSONResponse({"detail": "Nenhum rosto detetado"}, status_code=400)
+        msg = "Rosto muito pequeno/distante: aproxime-se da câmera" if pequeno else "Nenhum rosto detetado"
+        return JSONResponse({"detail": msg}, status_code=400)
 
-    media = np.mean(embeddings, axis=0)
-    media = (media / np.linalg.norm(media)).astype(np.float32)
-    db.update_embedding(student_id, media.tobytes())
+    # acumula com as amostras já salvas (recapturar = adicionar novas poses/iluminação)
+    galeria = []
+    try:
+        with db.get_connection() as conn:
+            row = conn.execute("SELECT embedding FROM students WHERE id = ?", (student_id,)).fetchone()
+        if row and row[0]:
+            antigo = np.frombuffer(row[0], dtype=np.float32)
+            if antigo.size % 128 == 0:
+                galeria = list(antigo.reshape(-1, 128))
+    except Exception as e:
+        _avisar_uma_vez("galeria", f"Falha ao ler amostras antigas: {e!r}")
+    galeria = (galeria + embeddings)[-MAX_AMOSTRAS:]
+    db.update_embedding(student_id, np.asarray(galeria, dtype=np.float32).tobytes())
+    total = len(galeria)
+    if arcs:
+        with db.get_connection() as conn:
+            conn.executemany("INSERT INTO face_samples (student_id, model, vec) VALUES (?, ?, ?)",
+                             [(student_id, ARC_MODELO, a.astype(np.float32).tobytes()) for a in arcs])
+            # mantém só as MAX_AMOSTRAS mais recentes
+            conn.execute("DELETE FROM face_samples WHERE student_id = ? AND model = ? AND id NOT IN ("
+                         "SELECT id FROM face_samples WHERE student_id = ? AND model = ? ORDER BY id DESC LIMIT ?)",
+                         (student_id, ARC_MODELO, student_id, ARC_MODELO, MAX_AMOSTRAS))
+            total = conn.execute("SELECT COUNT(*) FROM face_samples WHERE student_id = ? AND model = ?",
+                                 (student_id, ARC_MODELO)).fetchone()[0]
+            conn.commit()
     invalidar_cache_alunos()
-    return {"status": "success", "message": "Biometria capturada", "amostras": len(embeddings)}
+    return {"status": "success", "message": "Biometria capturada", "amostras": total,
+            "modelo": ARC_MODELO if arcs else "sface"}
 
 @app.delete("/api/v1/students/{student_id}")
 def delete_student(student_id: int):
     db.delete_student(student_id)
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM face_samples WHERE student_id = ?", (student_id,))
+        conn.commit()
     invalidar_cache_alunos()
     with reg_lock:
         reconhecidos.pop(f"RM{student_id:04d}", None)
@@ -714,6 +1170,8 @@ def get_events():
 def reset_session():
     db.reset_session()
     _ultimo_registro.clear()
+    _votos.clear()
+    trilhas.clear()
     global _contador_desconhecidos
     with reg_lock:
         reconhecidos.clear()

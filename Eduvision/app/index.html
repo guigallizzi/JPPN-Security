@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>JPPN · Command Center</title>
+<title>JPPN Security School</title>
 <link rel="icon" href="/static/logo.jpeg?v=18">
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;800&family=Rajdhani:wght@500;600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
 <style>
@@ -67,7 +67,7 @@ font-size:13px;letter-spacing:.16em;text-transform:uppercase;font-weight:700}
 .cam img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
 .cam::before,.cam::after{content:"";position:absolute;width:22px;height:22px;z-index:2;border:2px solid var(--cyan);pointer-events:none}
 .cam::before{top:8px;left:8px;border-right:0;border-bottom:0}.cam::after{bottom:8px;right:8px;border-left:0;border-top:0}
-.cams{display:grid;grid-template-rows:1.7fr 1fr;gap:12px;flex:1;min-height:0}
+.cams{display:grid;grid-template-rows:1fr;gap:12px;flex:1;min-height:0}
 
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 .stat{padding:12px 14px}.stat .l{font-size:11px;letter-spacing:.16em;color:var(--mut);text-transform:uppercase}
@@ -104,16 +104,16 @@ input:focus{border-color:var(--cyan);box-shadow:0 0 14px rgba(56,213,255,.35)}
 #toasts{position:fixed;right:18px;bottom:18px;z-index:99;display:flex;flex-direction:column;gap:8px}
 .toast{padding:10px 16px;border-radius:12px;font-weight:700;background:rgba(14,50,130,.9);border:1px solid var(--line);backdrop-filter:blur(10px);animation:pop .2s}
 .toast.err{border-color:var(--bad);color:#ffd0d8}.toast.okk{border-color:var(--ok)}
-@media(max-width:1000px){body{overflow:auto;height:auto}main{display:flex;flex-direction:column}.cams{grid-template-rows:none}.cam{min-height:240px}.mbody{grid-template-columns:1fr;overflow:auto}.col .panel{max-height:340px}}
+@media(max-width:1000px){body{overflow:auto;height:auto}main{display:flex;flex-direction:column}.cams{grid-template-rows:none}.cam{min-height:300px}.mbody{grid-template-columns:1fr;overflow:auto}.col .panel{max-height:340px}}
 </style>
 </head>
 <body>
 <div id="splash"><div class="logo"><span class="fb">JP</span><img src="/static/logo.jpeg?v=18" alt="" style="object-fit:cover;width:100%;height:100%" onerror="this.remove()"></div>
-<div class="wm orb">JPPN</div><div class="sub orb">EDUVISION // COMMAND CENTER</div><div class="bar"><i></i></div></div>
+<div class="wm orb">JPPN</div><div class="sub orb">SECURITY SCHOOL</div><div class="bar"><i></i></div></div>
 <header class="glass">
   <div class="brand">
     <div class="logo"><span class="fb">JP</span><img src="/static/logo.jpeg?v=18" alt="JPPN" width="92" height="92" style="object-fit:cover" onerror="this.remove()"></div>
-    <div><div class="wm orb">JPPN</div><h1 class="orb">EDUVISION // COMMAND CENTER</h1><div class="sub">RECONHECIMENTO FACIAL · PERÍMETRO SEGURO</div></div>
+    <div><div class="wm orb">JPPN</div><h1 class="orb">SECURITY SCHOOL</h1><div class="sub">RECONHECIMENTO FACIAL · PERÍMETRO SEGURO</div></div>
   </div>
   <div class="tools">
     <div class="chip"><span class="dot" id="d-cam"></span><span id="t-cam">CAM_01</span></div>
@@ -128,7 +128,6 @@ input:focus{border-color:var(--cyan);box-shadow:0 0 14px rgba(56,213,255,.35)}
   <div class="col">
     <div class="cams">
       <section class="glass panel camp"><div class="ph"><span class="t">● CAM_01 // SALA DE AULA</span><small id="src1">--</small></div><div class="cam"><img src="/video/1" alt="CAM_01"></div></section>
-      <section class="glass panel camp"><div class="ph"><span class="t">● CAM_02 // PERÍMETRO</span><small id="src2">--</small></div><div class="cam"><img src="/video/2" alt="CAM_02"></div></section>
     </div>
   </div>
 
@@ -149,7 +148,7 @@ input:focus{border-color:var(--cyan);box-shadow:0 0 14px rgba(56,213,255,.35)}
   </div>
 </main>
 
-<footer class="glass mono"><span><img class="mini" style="width:22px;height:22px;margin-right:8px" src="/static/logo.jpeg?v=18" onerror="this.remove()">EQUIPE JPPN · SECURITY SYSTEM // CORE v7.4</span><span id="clock">--:--:--</span></footer>
+<footer class="glass mono"><span><img class="mini" style="width:22px;height:22px;margin-right:8px" src="/static/logo.jpeg?v=18" onerror="this.remove()">JPPN SECURITY SCHOOL</span><span id="clock">--:--:--</span></footer>
 
 <!-- JANELA DE CADASTRO -->
 <div class="overlay" id="ov" onclick="if(event.target===this)closeModal()">
@@ -191,7 +190,6 @@ async function loadStatus(){try{
   $('d-ia').className='dot '+(s.ai_ready?'on':'off');$('t-ia').textContent=s.ai_ready?'IA ONLINE':'IA OFFLINE';
   $('t-fps').textContent=Math.round(s.fps_1||0)+' FPS';
   $('src1').textContent=s.camera_1_online?s.camera_1_source+' · AO VIVO':'OFFLINE';
-  $('src2').textContent=s.camera_2_online?'AIBOX · AO VIVO':'STANDBY';
   const n=s.current_intruders_count||0;$('s-int').textContent=n;$('card-int').classList.toggle('alert',n>0);
 }catch(e){}}
 
