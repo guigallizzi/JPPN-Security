@@ -32,14 +32,14 @@ cv2.setNumThreads(max(2, (os.cpu_count() or 4) // 2))
 # ---------------------------------------------------------------------------
 # Parâmetros de reconhecimento
 # ---------------------------------------------------------------------------
-LIMIAR_SIMILARIDADE = getattr(C, "LIMIAR_SIMILARIDADE", 0.363)  # recomendado p/ SFace (cosseno); ajustável no config.py
-DEBUG_IA = False              # mostra a similaridade no vídeo/console para diagnóstico (ponha False depois)
-LIMIAR_INTRUSO = 0.85         # confiança mínima do detector para contar como intruso
+LIMIAR_SIMILARIDADE = getattr(C, "LIMIAR_SIMILARIDADE", 0.45)  # SFace (cosseno, média das 3 melhores amostras). Ajustável no config.py
+DEBUG_IA = True               # mostra a similaridade no vídeo/console para diagnóstico (ponha False depois)
+LIMIAR_INTRUSO = 0.78         # confiança mínima do detector para contar como intruso (antes 0.85: rosto aparecia como desconhecido mas não contava)
 LARGURA_DETECCAO = 2560       # a detecção roda numa imagem reduzida (maior = acha rostos mais distantes, mais lento)
 CONF_DETECTOR = 0.75          # confiança mínima do YuNet para considerar um rosto (antes 0.8)
 MIN_LADO_RECONHECER = 16      # rostos menores que isso (px) ficam "distante": nem reconhece nem acusa intruso
 LADO_ROSTO_BOM = 40           # abaixo disso o rosto é "pequeno": exige similaridade maior (+BONUS_PEQUENO)
-BONUS_PEQUENO = 0.05
+BONUS_PEQUENO = 0.08
 ZOOM_LARGURA = 220            # zoom na cabeça: amplia o recorte até ~essa largura (px)
 ZOOM_MAX = 4.0                # ampliação máxima do zoom digital
 MARGEM_AMBIGUIDADE = 0.05     # o melhor aluno precisa vencer o 2º colocado por essa margem (evita confundir parecidos)
@@ -54,7 +54,8 @@ REVERIFICAR_S = 1.0           # pessoa já identificada: recalcula a biometria s
 CONFIRMAR_ALUNO = 3           # reconhecimentos do mesmo aluno para confirmar presença (roteiro: não confirmar com 1 frame)
 AMOSTRAS_POR_CAPTURA = 10     # embeddings coletados a cada clique em CAPTURAR
 MAX_AMOSTRAS = 40             # máximo de amostras guardadas por aluno (recapturar ACUMULA poses)
-MIN_LADO_CADASTRO = 30        # rosto mínimo (px) aceito no cadastro (baixo p/ cadastrar SENTADO na cadeira)
+MIN_LADO_CADASTRO = 50        # rosto mínimo (px) no cadastro: amostra pequena/borrada "parece com todo mundo"
+CONF_CADASTRO = 0.85          # confiança mínima do detector na amostra de cadastro
 # --- Rastreamento de pessoas (YOLO): reconhece o rosto UMA vez e mantém o nome na pessoa
 #     mesmo de lado / olhando para baixo / de costas, enquanto ela continuar no lugar.
 USAR_TRACKING = getattr(C, "USAR_TRACKING", True)
@@ -62,22 +63,28 @@ CONF_PESSOA = 0.35            # confiança mínima do YOLO para "pessoa"
 IMGSZ_YOLO = 960              # resolução de entrada do YOLO (maior = acha pessoas menores, mais lento)
 IOU_MESMA_PESSOA = 0.30       # sobreposição mínima entre caixas p/ ser a mesma pessoa no frame seguinte
 TTL_TRILHA = 8.0              # segundos que uma pessoa some (oclusão) antes de perder o nome
-FRONTAL_MIN, FRONTAL_MAX = 0.25, 0.75  # rosto "de frente" (nariz entre os olhos): só esses contam como intruso
+FRONTAL_MIN, FRONTAL_MAX = 0.20, 0.80  # rosto "de frente" (nariz entre os olhos): só esses contam como intruso
 PROCESSAR_A_CADA = 3          # (não usado: a IA roda em thread própria)
 ROI_CAM_1 = getattr(C, "ROI_CAM_1", None)  # área das cadeiras (x1, y1, x2, y2) em fração da imagem; None = imagem toda
 LARGURA_RAPIDA = 960          # detector rápido (só posição dos quadros) roda nessa largura a cada frame
 YOLO_A_CADA = 3               # roda o YOLO (pesado) 1 a cada N ciclos de IA; entre eles reaproveita as pessoas
 IA_INTERVALO_MIN = 0.12       # s entre análises da IA (~8/s). Maior = mais FPS de vídeo, menos reatividade
-LIMIAR_MESMO_DESCONHECIDO = 0.40  # similaridade p/ considerar que dois rostos desconhecidos são a MESMA pessoa
-CONFIRMAR_APOS = 3            # detecções seguidas para confirmar um desconhecido (evita falso alarme de 1 frame)
-JANELA_CONFIRMACAO = 4        # segundos máx. entre essas detecções
-MIN_LADO_ROSTO = 40           # rostos menores que isso (px) não são rastreados
+LIMIAR_MESMO_DESCONHECIDO = 0.45  # similaridade p/ religar um desconhecido que SAIU e VOLTOU (antes 0.40: juntava 2 pessoas)
+LIMIAR_FORTE_DESCONHECIDO = 0.60  # similaridade alta: mesma pessoa mesmo se ela "pulou" de lugar
+VIVO_S = 2.0                  # desconhecido visto há menos que isso está "na tela": não pode ser outro rosto em outro lugar
+CONFIRMAR_APOS = 2            # detecções (de frente) mínimas para confirmar um desconhecido
+ESPERA_INTRUSO_S = 4.0        # o rosto precisa continuar SEM ser reconhecido por N s antes de virar intruso
+                              # (aluno que demora a ser reconhecido ao chegar não cai no histórico)
+PROTECAO_ALUNO_S = 3.0        # rosto no MESMO lugar onde um aluno foi reconhecido há < N s não vira intruso (oscilação)
+JANELA_CONFIRMACAO = 6        # segundos máx. entre essas detecções
+MIN_LADO_ROSTO = 24           # rostos menores que isso (px) não viram intruso (antes 40: rosto distante nunca era contado)
 COOLDOWN_PRESENCA = 60        # segundos entre registros de presença do mesmo aluno
 COOLDOWN_INTRUSO = 10         # segundos entre registros de evento de intruso
 CACHE_ALUNOS_SEG = 3          # recarrega embeddings do banco a cada N segundos
 
 COR_RECONHECIDO = (0, 255, 120)
 COR_INTRUSO = (0, 140, 255)
+COR_VERIFICANDO = (0, 220, 255)   # amarelo: rosto não reconhecido, ainda confirmando
 
 # ---------------------------------------------------------------------------
 # Modelos de IA (YuNet & SFace)
@@ -124,7 +131,8 @@ MODELO_BIO = "arc" if arc is not None else "sface"
 if arc is not None:  # limiares próprios do ArcFace
     LIMIAR_SIMILARIDADE = LIMIAR_ARC
     MARGEM_AMBIGUIDADE = MARGEM_ARC
-    LIMIAR_MESMO_DESCONHECIDO = 0.30
+    LIMIAR_MESMO_DESCONHECIDO = 0.38
+    LIMIAR_FORTE_DESCONHECIDO = 0.55
 SCORE_CONFIRMA = CONFIRMAR_ALUNO * LIMIAR_SIMILARIDADE  # ~3 boas observações para fixar o nome
 
 if det is None or rec is None:
@@ -169,6 +177,7 @@ _cache_alunos = {"t": 0.0, "dados": []}
 _ultimo_registro = {}            # rm -> timestamp do último log de presença
 _votos = {}                      # rm -> {"hits", "t0", "last"} para confirmar o aluno em vários frames
 _ultimo_intruso = 0.0
+_alunos_recentes = []           # (cx, cy, lado, t, rótulo, rm) de rostos reconhecidos como aluno (sem tracking)
 _erros_vistos = set()
 
 frame_id = {1: 0}                # contador de frames novos (o stream só envia frames novos)
@@ -409,30 +418,67 @@ def _miniatura(frame, face):
     return ("data:image/jpeg;base64," + base64.b64encode(buf).decode()) if ok else None
 
 
-def rastrear_desconhecido(frame, face, feat, agora):
-    """Diferencia pessoas desconhecidas pelo embedding. Cada pessoa gera UMA ocorrência (na 1ª detecção);
-    voltar a aparecer só atualiza 'last_seen'. Retorna o nº do desconhecido (None se ainda não confirmado)."""
+def rastrear_desconhecido(frame, face, feat, agora, ocupados, tid=None, conta=True):
+    """Cada desconhecido vira UMA ficha (1 evento na confirmação). A ligação rosto -> ficha é feita por:
+    1) trilha do YOLO (mesma pessoa), 2) mesma posição há pouco tempo, 3) embedding (pessoa que saiu e voltou).
+    'ocupados' = fichas já usadas neste frame: dois rostos no mesmo frame NUNCA caem na mesma ficha.
+    Retorna o nº do desconhecido (None enquanto não confirmado)."""
     global _contador_desconhecidos
     novo = None
+    x, y, w, h = [float(v) for v in face[:4]]
+    cx, cy, lado = x + w / 2, y + h / 2, max(w, h, 1.0)
+
+    def _sim(c):
+        return max(float(np.dot(feat, g)) for g in c["galeria"])
+
+    def _livre_de_trilha(c):  # ficha não está presa a OUTRA pessoa rastreada que ainda existe
+        return c.get("tid") is None or c["tid"] == tid or c["tid"] not in trilhas
+
     with reg_lock:
         desconhecidos[:] = [d for d in desconhecidos if d["confirmado"] or agora - d["last_seen"] < 30]
-        d, melhor = None, -1.0
-        for c in desconhecidos:
-            sim = max(float(np.dot(feat, g)) for g in c["galeria"])
-            if sim > melhor:
-                melhor, d = sim, c
-        if d is not None and melhor >= LIMIAR_MESMO_DESCONHECIDO:
+        livres = [c for c in desconhecidos if id(c) not in ocupados]
+        d = None
+        if tid is not None:                                   # 1) mesma pessoa rastreada
+            d = next((c for c in livres if c.get("tid") == tid), None)
+        if d is None:                                         # 2) mesmo lugar, visto agora há pouco
+            perto = [(((c["cx"] - cx) ** 2 + (c["cy"] - cy) ** 2) ** 0.5 / lado, c) for c in livres
+                     if agora - c["last_seen"] < VIVO_S and _livre_de_trilha(c)]
+            perto = [pc for pc in perto if pc[0] < 1.5]
+            if perto:
+                d = min(perto, key=lambda pc: pc[0])[1]
+        if d is None:                                         # 3) embedding
+            melhor, cand = -1.0, None
+            for c in livres:
+                if not _livre_de_trilha(c):
+                    continue
+                sim = _sim(c)
+                vivo = agora - c["last_seen"] < VIVO_S       # está na tela em outro lugar: só com similaridade alta
+                lim = LIMIAR_FORTE_DESCONHECIDO if vivo else LIMIAR_MESMO_DESCONHECIDO
+                if sim >= lim and sim > melhor:
+                    melhor, cand = sim, c
+            d = cand
+
+        if d is None and not conta:
+            return None  # rosto de lado/fraco: só segue fichas que já existem, não cria alerta novo
+        if d is not None and not conta:
+            d["last_seen"] = agora
+        elif d is not None:
             if not d["confirmado"] and agora - d["last_seen"] > JANELA_CONFIRMACAO:
                 d["hits"], d["first_seen"] = 0, agora
             d["hits"] += 1
             d["last_seen"] = agora
-            if melhor < 0.8 and len(d["galeria"]) < 8:
-                d["galeria"].append(feat)  # guarda poses diferentes da mesma pessoa
+            sim = _sim(d)
+            if 0.25 <= sim < 0.8 and len(d["galeria"]) < 8:
+                d["galeria"].append(feat)  # guarda poses diferentes da MESMA pessoa (sem misturar pessoas)
         else:
             d = {"hits": 1, "first_seen": agora, "last_seen": agora, "galeria": [feat],
                  "confirmado": False, "numero": None, "thumb": None}
             desconhecidos.append(d)
-        if not d["confirmado"] and d["hits"] >= CONFIRMAR_APOS:
+        d["cx"], d["cy"] = cx, cy
+        if tid is not None:
+            d["tid"] = tid
+        ocupados.add(id(d))
+        if not d["confirmado"] and d["hits"] >= CONFIRMAR_APOS and agora - d["first_seen"] >= ESPERA_INTRUSO_S:
             _contador_desconhecidos += 1
             d.update(confirmado=True, numero=_contador_desconhecidos, thumb=_miniatura(frame, face))
             novo = d["numero"]
@@ -443,6 +489,47 @@ def rastrear_desconhecido(frame, face, feat, agora):
         except Exception as e:
             _avisar_uma_vez("evento", f"Falha ao registrar evento: {e!r}")
     return numero
+
+
+def _descartar_desconhecido(tid):
+    """A pessoa rastreada foi reconhecida como aluno: a ficha de desconhecido dela era falso alarme."""
+    with reg_lock:
+        desconhecidos[:] = [d for d in desconhecidos if d.get("tid") != tid]
+
+
+def _descartar_pendente_perto(face, agora):
+    """Aluno reconhecido aqui: apaga a ficha de desconhecido AINDA NÃO confirmada nesse mesmo lugar
+    (era o próprio aluno antes de ser reconhecido)."""
+    x, y, w, h = [float(v) for v in face[:4]]
+    cx, cy, lado = x + w / 2, y + h / 2, max(w, h, 1.0)
+    with reg_lock:
+        desconhecidos[:] = [d for d in desconhecidos if d["confirmado"] or agora - d["last_seen"] > VIVO_S
+                            or ((d["cx"] - cx) ** 2 + (d["cy"] - cy) ** 2) ** 0.5 > 1.5 * lado]
+
+
+def _perto_de_aluno(face, inf, usados, agora):
+    """Sem tracking: aluno reconhecido AQUI agora há pouco e cuja similaridade só caiu um pouco neste frame?
+    Só mantém o nome se o rosto ainda PARECE com esse aluno (outra pessoa no lugar dele não herda o nome)
+    e se o aluno não está em outro rosto neste frame."""
+    x, y, w, h = [float(v) for v in face[:4]]
+    cx, cy = x + w / 2, y + h / 2
+    _alunos_recentes[:] = [a for a in _alunos_recentes if agora - a[3] < PROTECAO_ALUNO_S]
+    if inf["melhor"] is None or inf["sim"] < LIMIAR_SIMILARIDADE - 0.12:
+        return None
+    rm = _rm(inf["melhor"])
+    if rm in usados:
+        return None
+    for a in reversed(_alunos_recentes):
+        if a[5] == rm and ((a[0] - cx) ** 2 + (a[1] - cy) ** 2) ** 0.5 < 0.8 * max(a[2], w):
+            usados.add(rm)
+            return a[4]
+    return None
+
+
+def _candidato_intruso(inf):
+    """Rosto nítido, de frente e grande o bastante para virar intruso."""
+    return (inf["feat"] is not None and inf["conf"] >= LIMIAR_INTRUSO and inf["frontal"]
+            and min(inf["face"][2], inf["face"][3]) >= MIN_LADO_ROSTO)
 
 
 def _frontal(face):
@@ -459,7 +546,8 @@ def _identificar(feat, alunos):
     """Compara com a galeria de cada aluno. Retorna (aluno_aceito|None, melhor_aluno, melhor_sim)."""
     melhor, melhor_sim, segundo = None, -1.0, -1.0
     for aluno, galeria in alunos:
-        sim = float(np.max(galeria @ feat))  # melhor amostra do aluno (cosseno)
+        sims = np.sort(galeria @ feat)
+        sim = float(np.mean(sims[-3:]))  # média das 3 melhores amostras (1 amostra ruim não "casa" com todo mundo)
         if sim > melhor_sim:
             segundo = melhor_sim
             melhor_sim, melhor = sim, aluno
@@ -524,9 +612,11 @@ def detectar_pessoas(frame, agora):
     return saida
 
 
-def _por_rosto(frame, infos, agora):
+def _por_rosto(frame, infos, agora, ocupados=None):
     """Modo sem rastreamento (ou rosto sem pessoa associada): decide rosto a rosto."""
     resultados, intrusos = [], 0
+    ocupados = set() if ocupados is None else ocupados
+    usados = {_rm(i["aluno"]) for i in infos if i["aluno"] is not None}  # alunos já presentes neste frame
     for inf in infos:
         face, box = inf["face"], inf["box"]
         if inf["pequeno"] or inf["feat"] is None:
@@ -544,21 +634,26 @@ def _por_rosto(frame, infos, agora):
             v["last"] = agora
             if v["hits"] >= CONFIRMAR_ALUNO:
                 _presenca(aluno, inf["sim"], agora)  # grava presença só após confirmar
-            resultados.append((box, f"{aluno['name']} ({int(inf['sim'] * 100)}%)", COR_RECONHECIDO))
+            rot = aluno["name"]
+            _descartar_pendente_perto(face, agora)
+            _alunos_recentes.append((face[0] + face[2] / 2, face[1] + face[3] / 2, max(face[2], face[3]), agora, rot, rm))
+            resultados.append((box, rot, COR_RECONHECIDO))
             continue
-        label = "Desconhecido"
-        if inf["conf"] > LIMIAR_INTRUSO and inf["frontal"]:
+        rot_aluno = _perto_de_aluno(face, inf, usados, agora)
+        if rot_aluno:  # aluno cuja similaridade oscilou neste frame: mantém o nome, sem alarme
+            resultados.append((box, rot_aluno, COR_RECONHECIDO))
+            continue
+        numero = None
+        try:  # rosto de lado/oscilando continua com o mesmo nº (não fica piscando)
+            conta = _candidato_intruso(inf)
+            numero = rastrear_desconhecido(frame, face, inf["feat"], agora, ocupados, conta=conta)
+        except Exception as e:
+            _avisar_uma_vez("rastreio", f"Falha ao rastrear desconhecido: {e!r}")
+        if numero:
             intrusos += 1
-            if face[2] >= MIN_LADO_ROSTO:
-                try:
-                    numero = rastrear_desconhecido(frame, face, inf["feat"], agora)
-                    if numero:
-                        label = f"Desconhecido #{numero}"
-                except Exception as e:
-                    _avisar_uma_vez("rastreio", f"Falha ao rastrear desconhecido: {e!r}")
-            resultados.append((box, label, COR_INTRUSO))
+            resultados.append((box, f"Desconhecido #{numero}", COR_INTRUSO))
         else:
-            resultados.append((box, "Desconhecido", COR_INTRUSO))  # de lado: mostra, mas não conta intruso
+            resultados.append((box, "Desconhecido", COR_INTRUSO))
     return resultados, intrusos
 
 
@@ -600,8 +695,9 @@ def _atualizar_identidade(tid, t, inf, agora):
 
 
 def _por_pessoa(frame, infos, pessoas, agora):
-    """Modo com rastreamento: o nome fica preso na PESSOA, não no rosto."""
+    """Modo com rastreamento: o nome (ou o nº do desconhecido) fica preso na PESSOA, não no rosto."""
     resultados, intrusos = [], 0
+    ocupados = set()
     por_tid = {i["tid"]: i for i in infos if i["tid"] is not None}
     for tid, (x1, y1, x2, y2) in pessoas:
         t = trilhas[tid]
@@ -617,11 +713,14 @@ def _por_pessoa(frame, infos, pessoas, agora):
                         and inf["sim"] < dono["sim"] + MARGEM_AMBIGUIDADE:
                     inf["aluno"], inf["conflito"] = None, True
             _atualizar_identidade(tid, t, inf, agora)
-            if (inf["aluno"] is None and not inf["conflito"] and t["aluno"] is None
-                    and inf["frontal"] and inf["conf"] > LIMIAR_INTRUSO):
-                t["desc"] += 1  # rosto DE FRENTE e nítido que não bate com ninguém
-            elif inf["aluno"] is not None:
-                t["desc"] = 0
+            if t["aluno"] is None and inf["aluno"] is None and not inf["conflito"]:
+                try:
+                    n = rastrear_desconhecido(frame, inf["face"], inf["feat"], agora, ocupados, tid=tid,
+                                              conta=_candidato_intruso(inf))
+                    if n:
+                        t["num"] = n
+                except Exception as e:
+                    _avisar_uma_vez("rastreio", f"Falha ao rastrear desconhecido: {e!r}")
 
         # desenha só no ROSTO; sem rosto visível mas já identificado: quadro na região da cabeça
         if inf is not None:
@@ -631,25 +730,20 @@ def _por_pessoa(frame, infos, pessoas, agora):
             caixa = (int(x1 + 0.25 * lw), int(y1), int(0.5 * lw), int(0.5 * lw))
 
         if t["aluno"] is not None:
+            _descartar_desconhecido(tid)  # era aluno, não intruso (ficha pendente ou confirmada)
+            t["num"] = None
             # nome estável da pessoa (não pisca entre alunos a cada frame)
             _presenca(t["aluno"], t["sim"], agora)
-            resultados.append((caixa, f"{t['aluno']['name']} ({int(t['sim'] * 100)}%)", COR_RECONHECIDO))
-        elif t["desc"] >= CONFIRMAR_APOS:
-            intrusos += 1
-            if inf is not None and inf["feat"] is not None and inf["face"][2] >= MIN_LADO_ROSTO:
-                try:
-                    n = rastrear_desconhecido(frame, inf["face"], inf["feat"], agora)
-                    if n:
-                        t["num"] = n
-                except Exception as e:
-                    _avisar_uma_vez("rastreio", f"Falha ao rastrear desconhecido: {e!r}")
-            resultados.append((caixa, f"Desconhecido #{t['num']}" if t["num"] else "Desconhecido", COR_INTRUSO))
+            resultados.append((caixa, t["aluno"]["name"], COR_RECONHECIDO))
+        elif t.get("num"):
+            intrusos += 1  # continua contando mesmo se a pessoa abaixar a cabeça
+            resultados.append((caixa, f"Desconhecido #{t['num']}", COR_INTRUSO))
         elif inf is not None and inf["aluno"] is not None:
-            resultados.append((caixa, f"{inf['aluno']['name']} ({int(inf['sim'] * 100)}%)", COR_RECONHECIDO))
+            resultados.append((caixa, inf["aluno"]["name"], COR_RECONHECIDO))
         elif inf is not None and inf["feat"] is not None:
             resultados.append((caixa, "Desconhecido", COR_INTRUSO))
 
-    r2, i2 = _por_rosto(frame, [i for i in infos if i["tid"] is None], agora)
+    r2, i2 = _por_rosto(frame, [i for i in infos if i["tid"] is None], agora, ocupados)
     return resultados + r2, intrusos + i2
 
 
@@ -668,12 +762,18 @@ def _montar_info(img, face, face_frame, alunos, tid=None, calcular=True):
                 if (inf["aluno"] is not None and lado < LADO_ROSTO_BOM
                         and inf["sim"] < LIMIAR_SIMILARIDADE + BONUS_PEQUENO):
                     inf["aluno"] = None
+                # parece MAIS com um desconhecido já confirmado do que com o aluno: não é o aluno
+                if inf["aluno"] is not None:
+                    with reg_lock:
+                        galerias = [d["galeria"] for d in desconhecidos if d["confirmado"]]
+                    if any(max(float(np.dot(inf["feat"], g)) for g in gal) >= inf["sim"] for gal in galerias):
+                        inf["aluno"] = None
         except Exception as e:
             _avisar_uma_vez("reconhecimento", f"Falha no reconhecimento: {e!r}")
     return inf
 
 
-def _rosto_ampliado(frame, caixa):
+def _rosto_ampliado(frame, caixa, evitar=()):
     """Zoom digital na cabeça de uma pessoa (parte de cima da caixa do YOLO) para achar rostos distantes."""
     x1, y1, x2, y2 = [int(v) for v in caixa]
     H, W = frame.shape[:2]
@@ -689,12 +789,22 @@ def _rosto_ampliado(frame, caixa):
         _, faces = det.detect(up)
     if faces is None or len(faces) == 0:
         return None
-    f = max(faces, key=lambda v: v[2] * v[3]).copy()
-    ff = f.copy()
-    ff[:14] /= esc
-    ff[[0, 4, 6, 8, 10, 12]] += x1  # x da caixa e dos 5 landmarks (2/3 são largura/altura)
-    ff[[1, 5, 7, 9, 11, 13]] += y1  # y
-    return up, f, ff
+    # maior rosto do recorte que NÃO seja um rosto já encontrado (pessoas lado a lado)
+    for f in sorted(faces, key=lambda v: v[2] * v[3], reverse=True):
+        f = f.copy()
+        ff = f.copy()
+        ff[:14] /= esc
+        ff[[0, 4, 6, 8, 10, 12]] += x1  # x da caixa e dos 5 landmarks (2/3 são largura/altura)
+        ff[[1, 5, 7, 9, 11, 13]] += y1  # y
+        if not _ja_visto(ff, evitar):
+            return up, f, ff
+    return None
+
+
+def _ja_visto(ff, rostos):
+    """Centro do rosto cai dentro de um rosto já detectado?"""
+    cx, cy = ff[0] + ff[2] / 2, ff[1] + ff[3] / 2
+    return any(o[0] <= cx <= o[0] + o[2] and o[1] <= cy <= o[1] + o[3] for o in rostos)
 
 
 def _exclusivo(infos):
@@ -728,21 +838,28 @@ def analisar_frame(frame):
     ia_info["tracking"] = pessoas is not None
 
     # associa cada rosto à pessoa (centro do rosto na parte de cima do corpo); sem rosto -> zoom na cabeça
+    # (caixas sobrepostas: cada rosto vai para a pessoa cuja CABEÇA esperada está mais perto; 1 rosto por pessoa)
     dono_rosto = [None] * len(rostos)
     if pessoas is not None:
-        for tid, (x1, y1, x2, y2) in pessoas:
-            achou = False
-            for k, (_, f, ff) in enumerate(rostos):
-                if dono_rosto[k] is None:
-                    cx, cy = ff[0] + ff[2] / 2, ff[1] + ff[3] / 2
-                    if x1 <= cx <= x2 and y1 <= cy <= y1 + 0.6 * (y2 - y1):
-                        dono_rosto[k], achou = tid, True
-                        break
-            if not achou:
-                r = _rosto_ampliado(frame, (x1, y1, x2, y2))
-                if r is not None:
-                    rostos.append(r)
-                    dono_rosto.append(tid)
+        cands = []
+        for k, (_, f, ff) in enumerate(rostos):
+            cx, cy = ff[0] + ff[2] / 2, ff[1] + ff[3] / 2
+            for tid, (x1, y1, x2, y2) in pessoas:
+                if x1 <= cx <= x2 and y1 <= cy <= y1 + 0.6 * (y2 - y1):
+                    hx, hy = (x1 + x2) / 2, y1 + 0.12 * (y2 - y1)
+                    cands.append((((cx - hx) ** 2 + (cy - hy) ** 2) ** 0.5 / max(x2 - x1, 1), k, tid))
+        com_rosto = set()
+        for _, k, tid in sorted(cands):
+            if dono_rosto[k] is None and tid not in com_rosto:
+                dono_rosto[k] = tid
+                com_rosto.add(tid)
+        for tid, caixa in pessoas:
+            if tid in com_rosto:
+                continue
+            r = _rosto_ampliado(frame, caixa, [ff for (_, _, ff) in rostos])
+            if r is not None:
+                rostos.append(r)
+                dono_rosto.append(tid)
         ia_info["pessoas"] = len(pessoas)
 
     infos = []
@@ -767,7 +884,9 @@ def analisar_frame(frame):
     if DEBUG_IA and infos and agora - _ultimo_print_ia > 2:
         _ultimo_print_ia = agora
         print(f"[IA] alunos={len(alunos)} rostos={len(infos)} pessoas={ia_info['pessoas']} "
-              f"melhor={ia_info['melhor_nome']} sim={ia_info['melhor_sim']}")
+              f"limiar={LIMIAR_SIMILARIDADE:.2f} sims=" +
+              ", ".join(f"{i['melhor']['name'] if i['melhor'] else '-'}:{i['sim']:.2f}{'*' if i['aluno'] else ''}"
+                        for i in infos if i["feat"] is not None))
     return resultados, intrusos
 
 
@@ -1096,8 +1215,12 @@ def capture_sample(student_id: int, camera: str = "CAM_01"):
             houve_frame = True
             faces = detectar_rostos(img)
             if faces:
-                maior = max(faces, key=lambda f: f[2] * f[3])
-                if min(maior[2], maior[3]) < MIN_LADO_CADASTRO or float(maior[-1]) < 0.70:  # aceita rosto virado
+                faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+                maior = faces[0]
+                if len(faces) > 1 and faces[1][2] * faces[1][3] > 0.5 * maior[2] * maior[3]:
+                    pass  # 2 rostos de tamanho parecido: não dá pra saber quem é o aluno, ignora o frame
+                elif min(maior[2], maior[3]) < MIN_LADO_CADASTRO or float(maior[-1]) < CONF_CADASTRO \
+                        or not _frontal(maior):
                     pequeno = True
                 else:
                     feat = extrair_sface(img, maior)
@@ -1115,25 +1238,24 @@ def capture_sample(student_id: int, camera: str = "CAM_01"):
     if not houve_frame:
         return JSONResponse({"detail": "Frame indisponível (câmera offline)"}, status_code=400)
     if not embeddings:
-        msg = "Rosto muito pequeno/distante: aproxime-se da câmera" if pequeno else "Nenhum rosto detetado"
+        msg = "Rosto pequeno, de lado ou borrado: aproxime-se e olhe de frente para a câmera" if pequeno else "Nenhum rosto detetado"
         return JSONResponse({"detail": msg}, status_code=400)
 
-    # acumula com as amostras já salvas (recapturar = adicionar novas poses/iluminação)
-    galeria = []
-    try:
-        with db.get_connection() as conn:
-            row = conn.execute("SELECT embedding FROM students WHERE id = ?", (student_id,)).fetchone()
-        if row and row[0]:
-            antigo = np.frombuffer(row[0], dtype=np.float32)
-            if antigo.size % 128 == 0:
-                galeria = list(antigo.reshape(-1, 128))
-    except Exception as e:
-        _avisar_uma_vez("galeria", f"Falha ao ler amostras antigas: {e!r}")
-    galeria = (galeria + embeddings)[-MAX_AMOSTRAS:]
+    # descarta amostras que não batem com as demais (outra pessoa/borrão no meio da captura)
+    ref_lista = arcs if arcs else embeddings
+    if len(ref_lista) >= 3:
+        M = np.asarray(ref_lista)
+        media = (M @ M.T).mean(axis=1)
+        manter = [i for i in range(len(ref_lista)) if media[i] >= np.median(media) - 0.15]
+        embeddings = [embeddings[i] for i in manter]
+        arcs = [arcs[i] for i in manter] if arcs else arcs
+    # SUBSTITUI as amostras antigas (amostras ruins antigas faziam qualquer um virar esse aluno)
+    galeria = embeddings[-MAX_AMOSTRAS:]
     db.update_embedding(student_id, np.asarray(galeria, dtype=np.float32).tobytes())
     total = len(galeria)
     if arcs:
         with db.get_connection() as conn:
+            conn.execute("DELETE FROM face_samples WHERE student_id = ? AND model = ?", (student_id, ARC_MODELO))
             conn.executemany("INSERT INTO face_samples (student_id, model, vec) VALUES (?, ?, ?)",
                              [(student_id, ARC_MODELO, a.astype(np.float32).tobytes()) for a in arcs])
             # mantém só as MAX_AMOSTRAS mais recentes

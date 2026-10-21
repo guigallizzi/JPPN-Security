@@ -197,7 +197,7 @@ async function loadRec(){try{
   const l=await api('/api/v1/recognized');$('s-pres').textContent=l.length;
   $('live-n').textContent=l.filter(r=>r.live).length+' ao vivo';
   setHTML('rec',l.length?l.map(r=>`<div class="item ${r.live?'live':''}"><div class="av">${esc(ini(r.name))}</div>
-    <div class="info"><div class="nm">${esc(r.name)}</div><div class="meta">${esc(r.turma)} · ${esc(r.rm)} · ${Math.round(r.confidence*100)}%</div></div>
+    <div class="info"><div class="nm">${esc(r.name)}</div><div class="meta">${esc(r.turma)} · ${esc(r.rm)}</div></div>
     <div class="when mono">${r.live?'<span class="badge b-ok">AO VIVO</span><br>':''}${hora(r.first_seen)}</div></div>`).join(''):'<div class="empty">Aguardando reconhecimento...</div>');
 }catch(e){}}
 
