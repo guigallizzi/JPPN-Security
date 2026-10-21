@@ -2,12 +2,15 @@ import os
 
 # Precisa ser definido ANTES de importar o cv2.
 # TCP para estabilidade nas câmaras Intelbras + timeout de 4s para não travar quando o AIBOX está desligado.
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;4000000"
+# nobuffer/low_delay: não acumula frames atrasados (tira o delay do stream principal em alta resolução)
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;4000000|fflags;nobuffer|flags;low_delay"
 
 import sys
 import base64
 import time
 import threading
+import shutil
+import subprocess
 import cv2
 import numpy as np
 from pathlib import Path
@@ -35,7 +38,7 @@ cv2.setNumThreads(max(2, (os.cpu_count() or 4) // 2))
 LIMIAR_SIMILARIDADE = getattr(C, "LIMIAR_SIMILARIDADE", 0.45)  # SFace (cosseno, média das 3 melhores amostras). Ajustável no config.py
 DEBUG_IA = True               # mostra a similaridade no vídeo/console para diagnóstico (ponha False depois)
 LIMIAR_INTRUSO = 0.78         # confiança mínima do detector para contar como intruso (antes 0.85: rosto aparecia como desconhecido mas não contava)
-LARGURA_DETECCAO = 2560       # a detecção roda numa imagem reduzida (maior = acha rostos mais distantes, mais lento)
+LARGURA_DETECCAO = 1920       # a detecção roda numa imagem reduzida (maior = acha rostos mais distantes, mais lento)
 CONF_DETECTOR = 0.75          # confiança mínima do YuNet para considerar um rosto (antes 0.8)
 MIN_LADO_RECONHECER = 16      # rostos menores que isso (px) ficam "distante": nem reconhece nem acusa intruso
 LADO_ROSTO_BOM = 40           # abaixo disso o rosto é "pequeno": exige similaridade maior (+BONUS_PEQUENO)
@@ -54,8 +57,8 @@ REVERIFICAR_S = 1.0           # pessoa já identificada: recalcula a biometria s
 CONFIRMAR_ALUNO = 3           # reconhecimentos do mesmo aluno para confirmar presença (roteiro: não confirmar com 1 frame)
 AMOSTRAS_POR_CAPTURA = 10     # embeddings coletados a cada clique em CAPTURAR
 MAX_AMOSTRAS = 40             # máximo de amostras guardadas por aluno (recapturar ACUMULA poses)
-MIN_LADO_CADASTRO = 50        # rosto mínimo (px) no cadastro: amostra pequena/borrada "parece com todo mundo"
-CONF_CADASTRO = 0.85          # confiança mínima do detector na amostra de cadastro
+MIN_LADO_CADASTRO = 40        # rosto mínimo (px) no cadastro: amostra pequena/borrada "parece com todo mundo"
+CONF_CADASTRO = 0.80          # confiança mínima do detector na amostra de cadastro
 # --- Rastreamento de pessoas (YOLO): reconhece o rosto UMA vez e mantém o nome na pessoa
 #     mesmo de lado / olhando para baixo / de costas, enquanto ela continuar no lugar.
 USAR_TRACKING = getattr(C, "USAR_TRACKING", True)
@@ -67,10 +70,16 @@ FRONTAL_MIN, FRONTAL_MAX = 0.20, 0.80  # rosto "de frente" (nariz entre os olhos
 PROCESSAR_A_CADA = 3          # (não usado: a IA roda em thread própria)
 ROI_CAM_1 = getattr(C, "ROI_CAM_1", None)  # área das cadeiras (x1, y1, x2, y2) em fração da imagem; None = imagem toda
 LARGURA_RAPIDA = 960          # detector rápido (só posição dos quadros) roda nessa largura a cada frame
+LARGURA_MIN_DET = 1280        # stream pequeno (substream 704x480): AMPLIA até essa largura p/ achar rostos pequenos
+FPS_VIDEO = 25                # FPS do vídeo enviado ao navegador
+FPS_QUADRO = 25               # vezes/s que o quadro procura o rosto de novo
+SUAVIZAR = 0.55               # 0..1: quanto o quadro anda em direção ao rosto a cada frame (menor = mais suave)
+FALHAS_QUADRO = 4             # frames seguidos sem achar o rosto antes de apagar o quadro (evita quadro "solto")
 YOLO_A_CADA = 3               # roda o YOLO (pesado) 1 a cada N ciclos de IA; entre eles reaproveita as pessoas
 IA_INTERVALO_MIN = 0.12       # s entre análises da IA (~8/s). Maior = mais FPS de vídeo, menos reatividade
 LIMIAR_MESMO_DESCONHECIDO = 0.45  # similaridade p/ religar um desconhecido que SAIU e VOLTOU (antes 0.40: juntava 2 pessoas)
 LIMIAR_FORTE_DESCONHECIDO = 0.60  # similaridade alta: mesma pessoa mesmo se ela "pulou" de lugar
+PERSISTENCIA_S = 8.0          # intruso que virou o rosto/sumiu do detector continua contando (e com o mesmo nº) por N s
 VIVO_S = 2.0                  # desconhecido visto há menos que isso está "na tela": não pode ser outro rosto em outro lugar
 CONFIRMAR_APOS = 2            # detecções (de frente) mínimas para confirmar um desconhecido
 ESPERA_INTRUSO_S = 4.0        # o rosto precisa continuar SEM ser reconhecido por N s antes de virar intruso
@@ -168,6 +177,7 @@ camera_1_online = False
 camera_1_fonte = "NENHUMA"   # "AIBOX", "WEBCAM" ou "NENHUMA"
 fps_1 = 0
 current_intruders_count = 0
+cadastrando = False       # durante a captura da biometria a IA pausa (libera CPU e o detector)
 
 lock = threading.Lock()          # protege os frames
 ia_lock = threading.Lock()       # protege det/rec (não são thread-safe)
@@ -197,8 +207,88 @@ _contador_desconhecidos = 0
 # ---------------------------------------------------------------------------
 # Abertura de fontes de vídeo
 # ---------------------------------------------------------------------------
+class CapturaGst:
+    """Lê a câmera pelo GStreamer do sistema com DECODIFICAÇÃO POR HARDWARE (qtivdec da Qualcomm).
+    A CPU fica livre: dá para usar a resolução máxima da câmera sem delay. Mesma interface do cv2.VideoCapture."""
+
+    def __init__(self, url, w, h, conversor):
+        self.w, self.h = w, h
+        self.tam = w * h * 3
+        ip_porta = f"{C.IP_CAM_1}:{getattr(C, 'PORTA', 554)}"
+        caminho = url.split(ip_porta, 1)[1] if ip_porta in url else "/"
+        codec = getattr(C, "CODEC_CAM_1", "h264")
+        cmd = ["gst-launch-1.0", "-q",
+               "rtspsrc", f"location=rtsp://{ip_porta}{caminho}",
+               f"user-id={C.USUARIO}", f"user-pw={getattr(C, 'SENHA_REAL', C.SENHA)}",
+               "protocols=tcp", "latency=0", "drop-on-latency=true",
+               "!", f"rtp{codec}depay", "!", f"{codec}parse", "!", "qtivdec",
+               "!", "queue", "max-size-buffers=1", "leaky=downstream",  # descarta frame velho ANTES de converter
+               "!"] + conversor + [
+               "!", f"video/x-raw,format=BGR,width={w},height={h}",
+               "!", "fdsink", "fd=1", "sync=false"]
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+
+    def isOpened(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def read(self):
+        buf = bytearray()
+        while len(buf) < self.tam:
+            parte = self.proc.stdout.read(self.tam - len(buf))
+            if not parte:
+                return False, None
+            buf += parte
+        return True, np.frombuffer(buf, np.uint8).reshape(self.h, self.w, 3)
+
+    def release(self):
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=2)
+            except Exception:
+                pass
+            self.proc = None
+
+
+def _abrir_gst(url, w, h):
+    """Tenta o decodificador por hardware; confere se chega um frame válido em até 8 s."""
+    for nome, conv in (("qtivdec+videoconvert", ["videoconvert"]),
+                       ("qtivdec+qtivtransform", ["qtivtransform", "!", "videoconvert"])):
+        cap = CapturaGst(url, w, h, conv)
+        res = {}
+        t = threading.Thread(target=lambda: res.update(r=cap.read()), daemon=True)
+        t.start()
+        t.join(8)
+        ok, frame = res.get("r", (False, None))
+        if ok and frame is not None and frame.any():
+            print(f"[RTSP] HARDWARE ({nome}) conectado: {w}x{h}")
+            return cap
+        cap.release()
+        print(f"[RTSP] decodificação por hardware ({nome}) não funcionou")
+    return None
+
+
 def abrir_rtsp(url):
-    """Tenta abrir o stream RTSP (AIBOX). Retorna o cap pronto ou None."""
+    """Abre o RTSP: tenta a decodificação por HARDWARE (GStreamer/qtivdec); se não der, usa o FFmpeg (CPU)."""
+    if not url:
+        return None
+    cap = _abrir_rtsp_ffmpeg(url)
+    if cap is None or not getattr(C, "USAR_HW_DECODER", True) or shutil.which("gst-launch-1.0") is None:
+        return cap
+    ok, frame = cap.read()
+    if not ok or frame is None:
+        return cap
+    h, w = frame.shape[:2]
+    cap.release()  # o FFmpeg só serviu para descobrir a resolução
+    hw = _abrir_gst(url, w, h)
+    if hw is not None:
+        return hw
+    print("[RTSP] usando FFmpeg (CPU). Para resolução máxima sem delay, reduza o FPS da câmera.")
+    return _abrir_rtsp_ffmpeg(url)
+
+
+def _abrir_rtsp_ffmpeg(url):
+    """Tenta abrir o stream RTSP pelo FFmpeg do OpenCV (decodifica na CPU). Retorna o cap pronto ou None."""
     if not url:
         return None
     try:
@@ -336,14 +426,21 @@ def _avisar_uma_vez(chave, msg):
         print(f"[ERRO] {msg}")
 
 
+def _escalar(img, largura_max, largura_min=None):
+    """Reduz imagens grandes até largura_max e AMPLIA imagens pequenas até LARGURA_MIN_DET.
+    Retorna (imagem, escala) — multiplique as coordenadas detectadas por 'escala' para voltar ao original."""
+    h, w = img.shape[:2]
+    alvo = min(max(w, LARGURA_MIN_DET if largura_min is None else largura_min), largura_max)
+    if alvo == w:
+        return img, 1.0
+    escala = w / alvo
+    interp = cv2.INTER_AREA if alvo < w else cv2.INTER_CUBIC
+    return cv2.resize(img, (int(alvo), int(round(h / escala))), interpolation=interp), escala
+
+
 def detectar_rostos(img):
     """Detecta rostos numa imagem reduzida e devolve as coordenadas já na escala original."""
-    h, w = img.shape[:2]
-    escala = 1.0
-    pequena = img
-    if w > LARGURA_DETECCAO:
-        escala = w / LARGURA_DETECCAO
-        pequena = cv2.resize(img, (LARGURA_DETECCAO, int(round(h / escala))))
+    pequena, escala = _escalar(img, LARGURA_DETECCAO)
 
     with ia_lock:
         det.setInputSize((pequena.shape[1], pequena.shape[0]))
@@ -442,8 +539,8 @@ def rastrear_desconhecido(frame, face, feat, agora, ocupados, tid=None, conta=Tr
             d = next((c for c in livres if c.get("tid") == tid), None)
         if d is None:                                         # 2) mesmo lugar, visto agora há pouco
             perto = [(((c["cx"] - cx) ** 2 + (c["cy"] - cy) ** 2) ** 0.5 / lado, c) for c in livres
-                     if agora - c["last_seen"] < VIVO_S and _livre_de_trilha(c)]
-            perto = [pc for pc in perto if pc[0] < 1.5]
+                     if agora - c["last_seen"] < PERSISTENCIA_S and _livre_de_trilha(c)]
+            perto = [pc for pc in perto if pc[0] < 2.0]  # virar o rosto desloca um pouco o centro
             if perto:
                 d = min(perto, key=lambda pc: pc[0])[1]
         if d is None:                                         # 3) embedding
@@ -475,6 +572,7 @@ def rastrear_desconhecido(frame, face, feat, agora, ocupados, tid=None, conta=Tr
                  "confirmado": False, "numero": None, "thumb": None}
             desconhecidos.append(d)
         d["cx"], d["cy"] = cx, cy
+        d["box"] = (int(x), int(y), int(w), int(h))
         if tid is not None:
             d["tid"] = tid
         ocupados.add(id(d))
@@ -654,6 +752,14 @@ def _por_rosto(frame, infos, agora, ocupados=None):
             resultados.append((box, f"Desconhecido #{numero}", COR_INTRUSO))
         else:
             resultados.append((box, "Desconhecido", COR_INTRUSO))
+
+    # intrusos confirmados que viraram o rosto (o detector não achou neste frame): continuam na tela e na contagem
+    with reg_lock:
+        fantasmas = [d for d in desconhecidos if d["confirmado"] and id(d) not in ocupados and d.get("box")
+                     and agora - d["last_seen"] < PERSISTENCIA_S and d.get("tid") not in trilhas]
+    for d in fantasmas:
+        intrusos += 1
+        resultados.append((d["box"], f"Desconhecido #{d['numero']}", COR_INTRUSO))
     return resultados, intrusos
 
 
@@ -978,10 +1084,10 @@ def capturar_camera_1(url):
             contador = 0
             inicio = time.time()
 
-        anotado = desenhar(frame, _para_desenho(), fonte)
+        # só publica o frame cru: desenhar em 1080p/4MP aqui atrasava a leitura e o vídeo acumulava delay.
+        # As caixas são desenhadas no stream do navegador, já em 960 px (gerar_video).
         with lock:
             frame_limpo_1 = frame
-            frame_atual_1 = anotado
             frame_id[1] += 1
 
 
@@ -1009,21 +1115,21 @@ def loop_caixas():
             time.sleep(0.005)
             continue
         ultimo = fid
+        t_inicio = time.time()
         try:
-            h, w = frame.shape[:2]
-            esc = max(1.0, w / LARGURA_RAPIDA)
-            peq = cv2.resize(frame, (int(w / esc), int(h / esc))) if esc > 1 else frame
+            peq, esc = _escalar(frame, LARGURA_RAPIDA, LARGURA_RAPIDA)  # 960 px: rápido o bastante p/ ~25x/s
             det_rapido.setInputSize((peq.shape[1], peq.shape[0]))
             _, faces = det_rapido.detect(peq)
-            rapidas = [] if faces is None else [tuple(int(v * esc) for v in f[:4]) for f in faces]
+            rapidas = [] if faces is None else [tuple(int(v * esc) for v in f[:4]) for f in faces
+                                                if float(f[-1]) >= 0.6]
 
             atual = ia_estado["resultados"]
             if atual is not base_ref:          # chegou resultado novo da IA: reancora
-                base_ref, base = atual, list(atual)
+                base_ref, base = atual, [(bx, lab, cor, 0) for bx, lab, cor in atual]
             else:                              # mesmo resultado: segue a partir da última posição
                 base = anterior
             pares = []
-            for i, (bx, _, _) in enumerate(base):
+            for i, (bx, _, _, _) in enumerate(base):
                 bcx, bcy, lim = bx[0] + bx[2] / 2, bx[1] + bx[3] / 2, 1.5 * max(bx[2], bx[3], 20)
                 for k, (x, y, fw, fh) in enumerate(rapidas):
                     d = ((x + fw / 2 - bcx) ** 2 + (y + fh / 2 - bcy) ** 2) ** 0.5
@@ -1035,13 +1141,15 @@ def loop_caixas():
                 if i not in mapa and k not in usados:
                     mapa[i] = k
                     usados.add(k)
-            saida = [(rapidas[mapa[i]], lab, cor) if i in mapa else (bx, lab, cor)
-                     for i, (bx, lab, cor) in enumerate(base)]
-            anterior = saida
-            ia_estado["rapido"] = (time.time(), saida)
+            # quadro segue o rosto achado agora; sem rosto por FALHAS_QUADRO frames seguidos, some
+            seguido = [(rapidas[mapa[i]], lab, cor, 0) if i in mapa else (bx, lab, cor, f + 1)
+                       for i, (bx, lab, cor, f) in enumerate(base)]
+            anterior = [b for b in seguido if b[3] <= FALHAS_QUADRO]
+            ia_estado["rapido"] = (time.time(), [(bx, lab, cor) for bx, lab, cor, _ in anterior])
         except Exception as e:
             _avisar_uma_vez("seguidor", f"Falha no seguidor rápido: {e!r}")
             time.sleep(0.2)
+        time.sleep(max(0.0, 1 / FPS_QUADRO - (time.time() - t_inicio)))  # sobra CPU para o resto
 
 
 def loop_ia():
@@ -1053,6 +1161,9 @@ def loop_ia():
     while True:
         if det is None or rec is None:
             time.sleep(1)
+            continue
+        if cadastrando:
+            time.sleep(0.05)
             continue
 
         with lock:
@@ -1101,24 +1212,46 @@ if __name__ != "__main__":
     threading.Thread(target=loop_caixas, daemon=True).start()
 
 
+def _suavizar(anterior, alvo):
+    """Move cada quadro só uma parte do caminho até a nova posição (sem 'pulos')."""
+    saida, usados = [], set()
+    for bx, lab, cor in alvo:
+        cx, cy = bx[0] + bx[2] / 2, bx[1] + bx[3] / 2
+        cands = [(((pb[0] + pb[2] / 2 - cx) ** 2 + (pb[1] + pb[3] / 2 - cy) ** 2) ** 0.5, i)
+                 for i, (pb, pl, _) in enumerate(anterior) if pl == lab and i not in usados]
+        if cands:
+            d, i = min(cands)
+            if d < 2.5 * max(bx[2], bx[3], 10):
+                usados.add(i)
+                pb = anterior[i][0]
+                bx = tuple(pb[k] + SUAVIZAR * (bx[k] - pb[k]) for k in range(4))
+        saida.append((bx, lab, cor))
+    return saida
+
+
 def gerar_video(cam_id):
-    """Stream MJPEG: envia somente frames NOVOS (antes reenviava o mesmo frame várias vezes)."""
-    ultimo = -1
+    """Stream MJPEG: reduz o frame para 960 px e SÓ ENTÃO desenha as caixas (suavizadas). Máx. FPS_VIDEO por navegador."""
+    ultimo, t_ult = -1, 0.0
+    suave = []
     while True:
         with lock:
-            fid = frame_id[1]          # sistema com UMA câmera (CAM_01 / .108)
-            src = frame_atual_1
-        if src is None or fid == ultimo:
+            fid = frame_id[1]          # sistema com UMA câmera (CAM_01)
+            src = frame_limpo_1 if camera_1_online else None
+        if src is None or fid == ultimo or time.time() - t_ult < 1 / FPS_VIDEO:
             time.sleep(0.01)
             continue
-        ultimo = fid
+        ultimo, t_ult = fid, time.time()
 
+        esc = 1.0
         frame = src
-        if frame.shape[1] > 960:  # reduz streams grandes (RTSP 1080p) para o navegador
+        if frame.shape[1] > 960:
             esc = 960 / frame.shape[1]
-            frame = cv2.resize(frame, (960, int(frame.shape[0] * esc)))
+            frame = cv2.resize(frame, (960, int(frame.shape[0] * esc)), interpolation=cv2.INTER_AREA)
+        caixas = [((b[0] * esc, b[1] * esc, b[2] * esc, b[3] * esc), lab, cor) for b, lab, cor in _para_desenho()]
+        suave = _suavizar(suave, caixas)
+        frame = desenhar(frame, suave, camera_1_fonte)
 
-        ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
         if not ok:
             continue
         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n")
@@ -1177,7 +1310,7 @@ def get_intruders():
         itens = sorted((d for d in desconhecidos if d["confirmado"]), key=lambda d: d["first_seen"], reverse=True)
         return [{"id": d["numero"], "label": f"Desconhecido #{d['numero']}", "camera_id": "CAM_01",
                  "first_seen": int(d["first_seen"] * 1000), "last_seen": int(d["last_seen"] * 1000),
-                 "live": agora - d["last_seen"] <= 3, "thumb": d["thumb"]} for d in itens]
+                 "live": agora - d["last_seen"] <= PERSISTENCIA_S, "thumb": d["thumb"]} for d in itens]
 
 @app.get("/api/v1/students")
 def get_students():
@@ -1198,6 +1331,36 @@ def _frame_limpo(camera):
 
 @app.post("/api/v1/students/{student_id}/sample")
 def capture_sample(student_id: int, camera: str = "CAM_01"):
+    global cadastrando
+    t0 = time.time()
+    print(f"[CADASTRO] iniciando captura do aluno {student_id}...")
+    cadastrando = True
+    try:
+        r = _capturar_amostras(student_id, camera)
+    except Exception as e:
+        print(f"[CADASTRO] ERRO: {e!r}")
+        return JSONResponse({"detail": f"Erro na captura: {e!r}"}, status_code=500)
+    finally:
+        cadastrando = False
+    print(f"[CADASTRO] terminou em {time.time() - t0:.1f}s -> "
+          f"{r if isinstance(r, dict) else r.body.decode(errors='ignore')}")
+    return r
+
+
+def _detectar_cadastro(img):
+    """Detecção rápida para o cadastro: reduz a imagem para ~1280 px (o aluno está perto da câmera)."""
+    peq, esc = _escalar(img, 1280)
+    with ia_lock:
+        det.setInputSize((peq.shape[1], peq.shape[0]))
+        _, faces = det.detect(peq)
+    if faces is None or len(faces) == 0:
+        return []
+    faces = faces.copy()
+    faces[:, :14] *= esc
+    return list(faces)
+
+
+def _capturar_amostras(student_id, camera):
     if det is None or rec is None:
         return JSONResponse({"detail": "IA não inicializada (modelos .onnx não encontrados)"}, status_code=500)
 
@@ -1209,37 +1372,49 @@ def capture_sample(student_id: int, camera: str = "CAM_01"):
     arcs = []
     houve_frame = False
     pequeno = False
-    for _ in range(45):  # ~7 s: tempo para a pessoa girar a cabeça devagar
+    reserva, reserva_arc = [], []   # amostras "aceitáveis" (rosto menor/virado): usadas só se não houver boas
+    motivo = None
+    fim = time.time() + 10           # ~10 s: tempo para a pessoa girar a cabeça devagar
+    while time.time() < fim:
         img = _frame_limpo(camera)
         if img is not None:
             houve_frame = True
-            faces = detectar_rostos(img)
-            if faces:
+            faces = _detectar_cadastro(img)
+            if not faces:
+                motivo = motivo or "Nenhum rosto detectado"
+            else:
                 faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
                 maior = faces[0]
-                if len(faces) > 1 and faces[1][2] * faces[1][3] > 0.5 * maior[2] * maior[3]:
-                    pass  # 2 rostos de tamanho parecido: não dá pra saber quem é o aluno, ignora o frame
-                elif min(maior[2], maior[3]) < MIN_LADO_CADASTRO or float(maior[-1]) < CONF_CADASTRO \
-                        or not _frontal(maior):
+                lado, conf = min(maior[2], maior[3]), float(maior[-1])
+                if len(faces) > 1 and faces[1][2] * faces[1][3] > 0.7 * maior[2] * maior[3]:
+                    motivo = "Mais de um rosto do mesmo tamanho na imagem: deixe só o aluno perto da câmera"
+                elif lado < MIN_LADO_RECONHECER or conf < 0.65:
+                    motivo = f"Rosto muito pequeno ({int(lado)} px): aproxime-se da câmera"
                     pequeno = True
                 else:
+                    bom = lado >= MIN_LADO_CADASTRO and conf >= CONF_CADASTRO and _frontal(maior)
+                    lista, lista_arc = (embeddings, arcs) if bom else (reserva, reserva_arc)
                     feat = extrair_sface(img, maior)
                     fa = extrair_arc(img, maior) if MODELO_BIO == "arc" else None
                     ref = fa if fa is not None else feat
                     if feat is not None and (MODELO_BIO != "arc" or fa is not None) and \
-                            all(float(np.dot(ref, e)) < 0.93 for e in (arcs if MODELO_BIO == "arc" else embeddings)):
-                        embeddings.append(feat)
+                            all(float(np.dot(ref, e)) < 0.93 for e in (lista_arc if MODELO_BIO == "arc" else lista)):
+                        lista.append(feat)
                         if fa is not None:
-                            arcs.append(fa)
-                        if len(embeddings) >= AMOSTRAS_POR_CAPTURA:
-                            break
-        time.sleep(0.15)
+                            lista_arc.append(fa)
+                    if len(embeddings) >= AMOSTRAS_POR_CAPTURA:
+                        break
+        time.sleep(0.1)
 
     if not houve_frame:
         return JSONResponse({"detail": "Frame indisponível (câmera offline)"}, status_code=400)
+    if len(embeddings) < 3 and reserva:   # poucas amostras boas: completa com as aceitáveis
+        embeddings = embeddings + reserva[:AMOSTRAS_POR_CAPTURA - len(embeddings)]
+        arcs = arcs + reserva_arc[:AMOSTRAS_POR_CAPTURA - len(arcs)] if MODELO_BIO == "arc" else arcs
+        print(f"[CADASTRO] poucas amostras ideais; usando {len(embeddings)} (aproxime-se/olhe de frente para melhorar)")
     if not embeddings:
-        msg = "Rosto pequeno, de lado ou borrado: aproxime-se e olhe de frente para a câmera" if pequeno else "Nenhum rosto detetado"
-        return JSONResponse({"detail": msg}, status_code=400)
+        print(f"[CADASTRO] falhou: {motivo}")
+        return JSONResponse({"detail": motivo or "Nenhum rosto detectado"}, status_code=400)
 
     # descarta amostras que não batem com as demais (outra pessoa/borrão no meio da captura)
     ref_lista = arcs if arcs else embeddings

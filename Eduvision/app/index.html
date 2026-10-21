@@ -133,7 +133,7 @@ input:focus{border-color:var(--cyan);box-shadow:0 0 14px rgba(56,213,255,.35)}
 
   <div class="col">
     <div class="stats">
-      <div class="glass stat"><div class="l">Presentes</div><div class="v" id="s-pres">0</div></div>
+      <div class="glass stat"><div class="l">Presentes agora</div><div class="v" id="s-pres">0</div><div class="l" id="s-hoje" style="font-size:11px;opacity:.75">hoje: 0</div></div>
       <div class="glass stat" id="card-int"><div class="l">Intrusos agora</div><div class="v" id="s-int">0</div></div>
       <div class="glass stat"><div class="l">Cadastrados</div><div class="v" id="s-cad">0</div></div>
     </div>
@@ -194,15 +194,17 @@ async function loadStatus(){try{
 }catch(e){}}
 
 async function loadRec(){try{
-  const l=await api('/api/v1/recognized');$('s-pres').textContent=l.length;
-  $('live-n').textContent=l.filter(r=>r.live).length+' ao vivo';
+  const l=(await api('/api/v1/recognized')).sort((a,b)=>(b.live-a.live)||(b.last_seen-a.last_seen));
+  const vivos=l.filter(r=>r.live).length;
+  $('s-pres').textContent=vivos;$('s-hoje').textContent='hoje: '+l.length;
+  $('live-n').textContent=vivos+' ao vivo';
   setHTML('rec',l.length?l.map(r=>`<div class="item ${r.live?'live':''}"><div class="av">${esc(ini(r.name))}</div>
     <div class="info"><div class="nm">${esc(r.name)}</div><div class="meta">${esc(r.turma)} · ${esc(r.rm)}</div></div>
     <div class="when mono">${r.live?'<span class="badge b-ok">AO VIVO</span><br>':''}${hora(r.first_seen)}</div></div>`).join(''):'<div class="empty">Aguardando reconhecimento...</div>');
 }catch(e){}}
 
 async function loadOcor(){try{
-  const l=await api('/api/v1/intruders');$('int-n').textContent=l.length+(l.length===1?' pessoa':' pessoas');
+  const l=(await api('/api/v1/intruders')).sort((a,b)=>(b.live-a.live)||(b.first_seen-a.first_seen));$('int-n').textContent=l.length+(l.length===1?' pessoa':' pessoas');
   setHTML('ocor',l.length?l.map(o=>`<div class="item ${o.live?'live':''}"><div class="av bad">${o.thumb?`<img src="${o.thumb}">`:'?'}</div>
     <div class="info"><div class="nm">${esc(o.label)}</div><div class="meta">${esc(o.camera_id)} · primeira detecção</div></div>
     <div class="when mono">${o.live?'<span class="badge b-warn">AGORA</span><br>':''}${hora(o.first_seen)}</div></div>`).join(''):'<div class="empty">Nenhum desconhecido detectado.</div>');

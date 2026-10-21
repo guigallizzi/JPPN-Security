@@ -40,7 +40,7 @@ SENHA_REAL = "fiap@2026"
 CODIFICAR_SENHA = False
 SENHA = quote(SENHA_REAL, safe="") if CODIFICAR_SENHA else SENHA_REAL
 
-IP_CAM_1 = "192.168.50.108"   # sistema com UMA câmera
+IP_CAM_1 = "192.168.50.109"   # sistema com UMA câmera
 
 
 def montar_rtsp(ip, canal=1, subtipo=1):
@@ -54,7 +54,9 @@ def montar_rtsp(ip, canal=1, subtipo=1):
 # CAM_01 faz o reconhecimento: usa o stream PRINCIPAL (alta resolução) para enxergar rostos mais longe.
 # Se o vídeo ficar lento/travando na AI Box, volte para 1 (substream 704x480).
 SUBTIPO_CAM_1 = 0
-CAMERA_RTSP_1 = montar_rtsp(IP_CAM_1, subtipo=SUBTIPO_CAM_1)
+# Câmera .109 não aceita /cam/realmonitor (erro 451): usa o caminho /h264/ch1/main/av_stream.
+# Se o vídeo travar, troque "main" por "sub" (stream mais leve).
+CAMERA_RTSP_1 = f"rtsp://{USUARIO}:{SENHA}@{IP_CAM_1}:{PORTA}/h264/ch1/main/av_stream"
 
 # Área das cadeiras que a IA analisa, em FRAÇÃO da imagem: (esquerda, topo, direita, base).
 # Ex.: (0.15, 0.30, 0.90, 1.00) = ignora 15% da esquerda, 30% de cima e 10% da direita.
